@@ -124,10 +124,9 @@ def load_opus_library() -> None:
             logger.info("Loaded Opus library from %s", candidate)
             return
 
-    raise RuntimeError(
-        "Opus library could not be loaded. Install the libopus system dependency."
-    )
-
+#    raise RuntimeError(
+ #       "Opus library could not be loaded. Install the libopus system dependency."
+  #  )
 
 def get_player(guild_id: int) -> GuildPlayer:
     return players.setdefault(guild_id, GuildPlayer())
