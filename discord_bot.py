@@ -35,16 +35,16 @@ bot = commands.Bot(
 )
 
 
-YTDL_OPTIONS = {
+YTDL_OPTIONS = {   
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
      "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-    "cookiefile": "cookies.txt"
-    
-}
+    "cookiefile": "cookies.txt",
+    'format': 'bestvideo+bestaudio/best' 
+}}
 
 FFMPEG_OPTIONS = {
     "before_options": (
