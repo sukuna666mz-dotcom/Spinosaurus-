@@ -36,7 +36,6 @@ bot = commands.Bot(
 
 
 YTDL_OPTIONS = {
-    "format": "bestaudio",
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
