@@ -44,7 +44,7 @@ YTDL_OPTIONS = {
      "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     "cookiefile": "cookies.txt",
     'format': 'bestvideo+bestaudio/best' 
-}}
+}
 
 FFMPEG_OPTIONS = {
     "before_options": (
