@@ -1,5 +1,4 @@
 discord.py
-yt-dlp>=2024.03.10
-discord.py
+yt-dlp
 PyNaCl
 davey
