@@ -41,7 +41,7 @@ YTDL_OPTIONS = {
     "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
-     "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     "cookiefile": "cookies.txt",
     "format": "bestaudio/best"
 }
