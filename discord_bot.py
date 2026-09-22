@@ -43,7 +43,7 @@ YTDL_OPTIONS = {
     "source_address": "0.0.0.0",
      "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     "cookiefile": "cookies.txt",
-    'format': 'bestvideo+bestaudio/best' 
+    "format": "bestaudio/best"
 }
 
 FFMPEG_OPTIONS = {
