@@ -35,7 +35,6 @@ bot = commands.Bot(
 )
 
 YTDL_OPTIONS = {
-    "extractor_args": {"youtube": {"player_client": ["web_embedded"], "player_skip": ["webpage"]}},
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
