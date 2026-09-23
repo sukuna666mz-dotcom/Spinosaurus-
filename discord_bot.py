@@ -34,16 +34,28 @@ bot = commands.Bot(
     ),
 )
 
-YTDL_OPTIONS = {
-    "extractor_args": {"youtube": {"player_client": ["default", "web_embedded"]}},
+BASE_YTDL_OPTIONS = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
-    "cookiefile": "cookies.txt",
-    "format": "bestaudio/best"
+    "format": "bestaudio/best",
 }
+
+# YouTube keeps changing which "player_client" works from day to day, so
+# instead of betting on a single configuration we try several in order and
+# use the first one that actually returns a playable stream.
+YTDL_OPTION_VARIANTS = [
+    {**BASE_YTDL_OPTIONS, "cookiefile": "cookies.txt",
+     "extractor_args": {"youtube": {"player_client": ["web_embedded"]}}},
+    {**BASE_YTDL_OPTIONS, "cookiefile": "cookies.txt",
+     "extractor_args": {"youtube": {"player_client": ["tv_simply"]}}},
+    {**BASE_YTDL_OPTIONS,
+     "extractor_args": {"youtube": {"player_client": ["ios", "android"]}}},
+    {**BASE_YTDL_OPTIONS, "cookiefile": "cookies.txt"},
+    {**BASE_YTDL_OPTIONS},
+]
 
 FFMPEG_OPTIONS = {
     "before_options": (
@@ -52,7 +64,7 @@ FFMPEG_OPTIONS = {
     "options": "-vn",
 }
 
-ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+_ytdl_instances = [yt_dlp.YoutubeDL(options) for options in YTDL_OPTION_VARIANTS]
 PANEL_ART_PATH = "attached_assets/generated_images/spinosaurus_panel_banner.png"
 PANEL_ART_FILENAME = "spinosaurus_panel_banner.png"
 VOICE_STATE_PATH = "voice_state.json"
@@ -216,12 +228,34 @@ async def extract_audio(
     search: str,
 ) -> tuple[discord.AudioSource, str, Optional[str], Optional[int], Optional[str]]:
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(
-        None,
-        lambda: ytdl.extract_info(search, download=False),
-    )
+
+    data = None
+    last_error: Optional[Exception] = None
+    for index, extractor in enumerate(_ytdl_instances):
+        try:
+            data = await loop.run_in_executor(
+                None,
+                lambda extractor=extractor: extractor.extract_info(
+                    search, download=False
+                ),
+            )
+            if data:
+                logger.info(
+                    "extract_audio succeeded using yt-dlp config #%s for %r",
+                    index,
+                    search,
+                )
+                break
+        except Exception as exc:  # noqa: BLE001 - we want to try the next variant
+            last_error = exc
+            logger.warning(
+                "yt-dlp config #%s failed for %r: %s", index, search, exc
+            )
+            continue
 
     if not data:
+        if last_error:
+            raise RuntimeError("لم يتم العثور على المقطع.") from last_error
         raise RuntimeError("لم يتم العثور على المقطع.")
 
     if "entries" in data:
