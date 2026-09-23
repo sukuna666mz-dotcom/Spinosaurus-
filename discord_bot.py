@@ -34,28 +34,19 @@ bot = commands.Bot(
     ),
 )
 
-BASE_YTDL_OPTIONS = {
-    "noplaylist": True,
-    "quiet": True,
-    "no_warnings": True,
-    "default_search": "ytsearch",
-    "source_address": "0.0.0.0",
-    "format": "bestaudio/best",
-}
+from pytubefix import YouTube
 
-# YouTube keeps changing which "player_client" works from day to day, so
-# instead of betting on a single configuration we try several in order and
-# use the first one that actually returns a playable stream.
-YTDL_OPTION_VARIANTS = [
-    {**BASE_YTDL_OPTIONS, "cookiefile": "cookies.txt",
-     "extractor_args": {"youtube": {"player_client": ["web_embedded"]}}},
-    {**BASE_YTDL_OPTIONS, "cookiefile": "cookies.txt",
-     "extractor_args": {"youtube": {"player_client": ["tv_simply"]}}},
-    {**BASE_YTDL_OPTIONS,
-     "extractor_args": {"youtube": {"player_client": ["ios", "android"]}}},
-    {**BASE_YTDL_OPTIONS, "cookiefile": "cookies.txt"},
-    {**BASE_YTDL_OPTIONS},
-]
+# بدلاً من إعدادات yt-dlp القديمة المعقدة:
+async def get_audio_url(query: str):
+    try:
+        # فحص إذا كان الرابط مباشر أو بحث
+        yt = YouTube(query)
+        stream = yt.streams.get_audio_only()
+        return stream.url
+    except Exception as e:
+        print(f"خطأ في استخراج الصوت: {e}")
+        return None
+        
 
 FFMPEG_OPTIONS = {
     "before_options": (
