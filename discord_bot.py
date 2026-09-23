@@ -35,13 +35,12 @@ bot = commands.Bot(
 )
 
 YTDL_OPTIONS = {
-    "extractor_args": {"youtube": {"player_client": ["default", "web_embedded"]}},
+    "extractor_args": {"youtube": {"player_client": ["ios", "android"]}},
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
-    "cookiefile": "cookies.txt",
     "format": "bestaudio/best"
 }
 
