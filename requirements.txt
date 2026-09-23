@@ -1,4 +1,1 @@
 discord.py
-yt-dlp
-PyNaCl
-davey
