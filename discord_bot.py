@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import discord
-import yt_dlp
+import pytubefix
 from discord.ext import commands
 
 
