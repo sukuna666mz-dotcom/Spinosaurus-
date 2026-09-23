@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import discord
-import pytubefix
+import yt_dlp
 from discord.ext import commands
 
 
@@ -34,26 +34,37 @@ bot = commands.Bot(
     ),
 )
 
-from pytubefix import YouTube
+BASE_YTDL_OPTIONS = {
+    "noplaylist": True,
+    "quiet": True,
+    "no_warnings": True,
+    "default_search": "ytsearch",
+    "source_address": "0.0.0.0",
+    "format": "bestaudio/best",
+}
 
-# بدلاً من إعدادات yt-dlp القديمة المعقدة:
-async def get_audio_url(query: str):
-    try:
-        # فحص إذا كان الرابط مباشر أو بحث
-        yt = YouTube(query)
-        stream = yt.streams.get_audio_only()
-        return stream.url
-    except Exception as e:
-        print(f"خطأ في استخراج الصوت: {e}")
-        return None
-        
+# YouTube keeps changing which "player_client" works from day to day, so
+# instead of betting on a single configuration we try several in order and
+# use the first one that actually returns a playable stream.
+YTDL_OPTION_VARIANTS = [
+    {**BASE_YTDL_OPTIONS, "cookiefile": "cookies.txt",
+     "extractor_args": {"youtube": {"player_client": ["web_embedded"]}}},
+    {**BASE_YTDL_OPTIONS, "cookiefile": "cookies.txt",
+     "extractor_args": {"youtube": {"player_client": ["tv_simply"]}}},
+    {**BASE_YTDL_OPTIONS,
+     "extractor_args": {"youtube": {"player_client": ["ios", "android"]}}},
+    {**BASE_YTDL_OPTIONS, "cookiefile": "cookies.txt"},
+    {**BASE_YTDL_OPTIONS},
+]
 
 FFMPEG_OPTIONS = {
     "before_options": (
         "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
     ),
     "options": "-vn",
-} 
+}
+
+_ytdl_instances = [yt_dlp.YoutubeDL(options) for options in YTDL_OPTION_VARIANTS]
 PANEL_ART_PATH = "attached_assets/generated_images/spinosaurus_panel_banner.png"
 PANEL_ART_FILENAME = "spinosaurus_panel_banner.png"
 VOICE_STATE_PATH = "voice_state.json"
