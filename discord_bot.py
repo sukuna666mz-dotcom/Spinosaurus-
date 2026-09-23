@@ -53,9 +53,7 @@ FFMPEG_OPTIONS = {
         "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
     ),
     "options": "-vn",
-}
-
-_ytdl_instances = [yt_dlp.YoutubeDL(options) for options in YTDL_OPTION_VARIANTS]
+} 
 PANEL_ART_PATH = "attached_assets/generated_images/spinosaurus_panel_banner.png"
 PANEL_ART_FILENAME = "spinosaurus_panel_banner.png"
 VOICE_STATE_PATH = "voice_state.json"
