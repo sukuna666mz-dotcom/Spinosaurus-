@@ -34,15 +34,29 @@ bot = commands.Bot(
     ),
 )
 
-YTDL_OPTIONS = {
+BASE_YTDL_OPTIONS = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "format": "bestaudio/best",
-    "cookiefile": "cookies.txt",
 }
+
+# YouTube keeps changing which "player_client" works from day to day, so
+# instead of betting on a single configuration we try several in order and
+# use the first one that actually returns a playable stream.
+YTDL_OPTION_VARIANTS = [
+    {**BASE_YTDL_OPTIONS, "cookiefile": "cookies.txt",
+     "extractor_args": {"youtube": {"player_client": ["web_embedded"]}}},
+    {**BASE_YTDL_OPTIONS, "cookiefile": "cookies.txt",
+     "extractor_args": {"youtube": {"player_client": ["tv_simply"]}}},
+    {**BASE_YTDL_OPTIONS,
+     "extractor_args": {"youtube": {"player_client": ["ios", "android"]}}},
+    {**BASE_YTDL_OPTIONS, "cookiefile": "cookies.txt"},
+    {**BASE_YTDL_OPTIONS},
+]
+
 FFMPEG_OPTIONS = {
     "before_options": (
         "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
@@ -50,7 +64,7 @@ FFMPEG_OPTIONS = {
     "options": "-vn",
 }
 
-ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+_ytdl_instances = [yt_dlp.YoutubeDL(options) for options in YTDL_OPTION_VARIANTS]
 PANEL_ART_PATH = "attached_assets/generated_images/spinosaurus_panel_banner.png"
 PANEL_ART_FILENAME = "spinosaurus_panel_banner.png"
 VOICE_STATE_PATH = "voice_state.json"
@@ -214,12 +228,34 @@ async def extract_audio(
     search: str,
 ) -> tuple[discord.AudioSource, str, Optional[str], Optional[int], Optional[str]]:
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(
-        None,
-        lambda: ytdl.extract_info(search, download=False),
-    )
+
+    data = None
+    last_error: Optional[Exception] = None
+    for index, extractor in enumerate(_ytdl_instances):
+        try:
+            data = await loop.run_in_executor(
+                None,
+                lambda extractor=extractor: extractor.extract_info(
+                    search, download=False
+                ),
+            )
+            if data:
+                logger.info(
+                    "extract_audio succeeded using yt-dlp config #%s for %r",
+                    index,
+                    search,
+                )
+                break
+        except Exception as exc:  # noqa: BLE001 - we want to try the next variant
+            last_error = exc
+            logger.warning(
+                "yt-dlp config #%s failed for %r: %s", index, search, exc
+            )
+            continue
 
     if not data:
+        if last_error:
+            raise RuntimeError("لم يتم العثور على المقطع.") from last_error
         raise RuntimeError("لم يتم العثور على المقطع.")
 
     if "entries" in data:
@@ -598,340 +634,4 @@ class MusicPanel(discord.ui.View):
             view=self,
         )
 
-    @discord.ui.button(
-        label="القائمة",
-        emoji="📜",
-        style=discord.ButtonStyle.secondary,
-        row=0,
-    )
-    async def show_queue(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        player = get_player(self.guild_id)
-        items = [
-            f"{index}. {track.title}"
-            for index, track in enumerate(player.queue[:10], start=1)
-        ]
-        queue_text = "\n".join(items) if items else "القائمة فارغة."
-        await interaction.response.send_message(queue_text, ephemeral=True)
-
-    @discord.ui.button(
-        label="تكرار",
-        emoji="🔁",
-        style=discord.ButtonStyle.secondary,
-        row=1,
-    )
-    async def toggle_repeat(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        player = get_player(self.guild_id)
-        player.repeat = not player.repeat
-        button.label = "التكرار: تشغيل" if player.repeat else "التكرار: إيقاف"
-        await interaction.response.edit_message(
-            embed=panel_embed(self.guild_id),
-            view=self,
-        )
-
-    @discord.ui.button(
-        label="خلط",
-        emoji="🔀",
-        style=discord.ButtonStyle.secondary,
-        row=1,
-    )
-    async def shuffle(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        player = get_player(self.guild_id)
-        random.shuffle(player.queue)
-        await interaction.response.edit_message(
-            content="تم خلط قائمة الانتظار.",
-            embed=panel_embed(self.guild_id),
-            view=self,
-        )
-
-    @discord.ui.button(
-        label="الصوت",
-        emoji="🔊",
-        style=discord.ButtonStyle.secondary,
-        row=1,
-    )
-    async def volume(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        await interaction.response.send_modal(VolumeModal(self.guild_id))
-
-    @discord.ui.button(
-        label="مساعدة",
-        emoji="❔",
-        style=discord.ButtonStyle.secondary,
-        row=2,
-    )
-    async def help_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        await interaction.response.send_message(
-            "الأوامر الأساسية:\n"
-            "`!music` تشغيل أو إضافة مقطع\n"
-            "`!queue` القائمة\n"
-            "`!skip` تخطّي\n"
-            "`!loop` تكرار\n"
-            "`!shuffle` خلط\n"
-            "`!volume 1-100` الصوت\n"
-            "`!stop` إيقاف ومغادرة",
-            ephemeral=True,
-        )
-
-
-@bot.event
-async def on_ready() -> None:
-    if not bot.user:
-        return
-
-    desired_name = os.getenv("BOT_NAME", "Spinosaurus").strip()
-    if desired_name and bot.user.name != desired_name:
-        try:
-            await bot.user.edit(username=desired_name)
-            logger.info("Bot username changed to %s", desired_name)
-        except discord.HTTPException:
-            logger.exception("Could not change bot username")
-    await bot.change_presence(
-        activity=discord.Game(name="🦖 !panel • Prehistoric Radio"),
-    )
-    global voice_state_restored
-    if not voice_state_restored:
-        load_voice_state()
-        voice_state_restored = True
-        for guild_id, player in players.items():
-            if player.keep_in_voice and player.voice_channel_id:
-                schedule_voice_reconnect(guild_id)
-    logger.info("Bot is online as %s (id=%s)", bot.user, bot.user.id)
-
-
-@bot.event
-async def on_disconnect() -> None:
-    logger.warning("Discord gateway disconnected; discord.py will reconnect automatically")
-
-
-@bot.event
-async def on_resumed() -> None:
-    logger.info("Discord gateway session resumed")
-
-
-@bot.event
-async def on_voice_state_update(
-    member: discord.Member,
-    before: discord.VoiceState,
-    after: discord.VoiceState,
-) -> None:
-    if not bot.user or member.id != bot.user.id or before.channel is None:
-        return
-    if after.channel is None:
-        player = players.get(member.guild.id)
-        if player and player.keep_in_voice:
-            logger.warning(
-                "Bot left voice unexpectedly in guild %s; scheduling reconnect",
-                member.guild.id,
-            )
-            schedule_voice_reconnect(member.guild.id)
-
-
-@bot.command(
-    name="music",
-    aliases=["p", "play"],
-    help="تشغيل أغنية أو إضافة رابط للقائمة",
-)
-async def play(ctx: commands.Context, *, search: str) -> None:
-    voice_client = await ensure_voice(ctx)
-    if voice_client is None or not ctx.guild:
-        return
-
-    player = get_player(ctx.guild.id)
-    track = Track(
-        query=search,
-        requested_by=getattr(ctx.author, "display_name", ""),
-    )
-    was_idle = not voice_client.is_playing() and not voice_client.is_paused()
-    player.queue.append(track)
-
-    if was_idle:
-        await start_next(ctx.guild.id, voice_client, ctx.channel)
-    else:
-        await ctx.send("تمت إضافة المقطع إلى قائمة الانتظار.")
-
-
-@bot.command(name="pause", help="إيقاف مؤقت")
-async def pause(ctx: commands.Context) -> None:
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.pause()
-        await ctx.send("تم الإيقاف المؤقت.")
-    else:
-        await ctx.send("لا يوجد مقطع يعمل حاليًا.")
-
-
-@bot.command(name="resume", help="استئناف التشغيل")
-async def resume(ctx: commands.Context) -> None:
-    if ctx.voice_client and ctx.voice_client.is_paused():
-        ctx.voice_client.resume()
-        await ctx.send("تم استئناف التشغيل.")
-    else:
-        await ctx.send("لا يوجد مقطع متوقف مؤقتًا.")
-
-
-@bot.command(name="skip", help="تخطي المقطع الحالي")
-async def skip(ctx: commands.Context) -> None:
-    if ctx.voice_client and (
-        ctx.voice_client.is_playing() or ctx.voice_client.is_paused()
-    ):
-        ctx.voice_client.stop()
-        await ctx.send("تم التخطي، يتم تشغيل المقطع التالي.")
-    else:
-        await ctx.send("لا يوجد مقطع يمكن تخطيه.")
-
-
-@bot.command(name="stop", help="إيقاف التشغيل ومغادرة الروم")
-async def stop(ctx: commands.Context) -> None:
-    if ctx.voice_client:
-        if ctx.guild:
-            await disconnect_player(ctx.guild.id, ctx.voice_client)
-        await ctx.send("تم إيقاف التشغيل ومغادرة الروم.")
-    else:
-        await ctx.send("البوت غير موجود في روم صوتي.")
-
-
-@bot.command(name="leave", help="مغادرة الروم الصوتي")
-async def leave(ctx: commands.Context) -> None:
-    await stop(ctx)
-
-
-@bot.command(name="queue", aliases=["q"], help="عرض قائمة الانتظار")
-async def queue(ctx: commands.Context) -> None:
-    if not ctx.guild:
-        return
-    player = get_player(ctx.guild.id)
-    if not player.queue:
-        await ctx.send("قائمة الانتظار فارغة.")
-        return
-    lines = [
-        f"{index}. **{track.title}**"
-        for index, track in enumerate(player.queue[:15], start=1)
-    ]
-    await ctx.send("\n".join(lines))
-
-
-@bot.command(name="shuffle", help="خلط قائمة الانتظار")
-async def shuffle(ctx: commands.Context) -> None:
-    if not ctx.guild:
-        return
-    player = get_player(ctx.guild.id)
-    random.shuffle(player.queue)
-    await ctx.send("تم خلط قائمة الانتظار.")
-
-
-@bot.command(name="loop", help="تفعيل أو إيقاف تكرار المقطع")
-async def loop(ctx: commands.Context) -> None:
-    if not ctx.guild:
-        return
-    player = get_player(ctx.guild.id)
-    player.repeat = not player.repeat
-    status = "مفعّل" if player.repeat else "متوقف"
-    await ctx.send(f"التكرار الآن: **{status}**.")
-
-
-@bot.command(name="volume", help="تغيير مستوى الصوت من 1 إلى 100")
-async def volume(ctx: commands.Context, value: int) -> None:
-    if not ctx.guild:
-        return
-    if not 1 <= value <= 100:
-        await ctx.send("استخدم رقمًا من 1 إلى 100.")
-        return
-    player = get_player(ctx.guild.id)
-    player.volume = value / 100
-    if player.source:
-        player.source.volume = player.volume
-    await ctx.send(f"تم ضبط الصوت على {value}%.")
-
-
-@bot.command(name="clear", help="مسح قائمة الانتظار")
-async def clear(ctx: commands.Context) -> None:
-    if not ctx.guild:
-        return
-    player = get_player(ctx.guild.id)
-    removed = len(player.queue)
-    player.queue.clear()
-    await ctx.send(f"تم مسح {removed} مقطع من قائمة الانتظار.")
-
-
-@bot.command(name="now", help="عرض المقطع الحالي")
-async def now(ctx: commands.Context) -> None:
-    current = (
-        players.get(ctx.guild.id).current.title
-        if ctx.guild and ctx.guild.id in players and players[ctx.guild.id].current
-        else None
-    )
-    if current:
-        await ctx.send(f"المقطع الحالي: **{current}**")
-    else:
-        await ctx.send("لا يوجد مقطع يعمل حاليًا.")
-
-
-@bot.command(name="panel", help="إظهار لوحة تحكم Spinosaurus")
-async def panel(ctx: commands.Context) -> None:
-    if not ctx.guild:
-        await ctx.send("لوحة التحكم تعمل داخل السيرفر فقط.")
-        return
-    if not os.path.exists(PANEL_ART_PATH):
-        await ctx.send(
-            embed=panel_embed(ctx.guild.id),
-            view=MusicPanel(ctx.guild.id),
-        )
-        return
-    artwork = discord.File(PANEL_ART_PATH, filename=PANEL_ART_FILENAME)
-    await ctx.send(
-        embed=panel_embed(ctx.guild.id),
-        view=MusicPanel(ctx.guild.id),
-        file=artwork,
-    )
-
-
-@bot.event
-async def on_command_error(
-    ctx: commands.Context,
-    error: commands.CommandError,
-) -> None:
-    if isinstance(error, commands.CommandNotFound):
-        return
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"استخدم `!{ctx.command.name} <القيمة المطلوبة>`.")
-        return
-    if isinstance(error, commands.BadArgument):
-        await ctx.send("القيمة غير صحيحة. جرّب الأمر مرة أخرى.")
-        return
-    if isinstance(error, commands.CommandInvokeError):
-        logger.exception("Command %s failed", ctx.command, exc_info=error.original)
-        await ctx.send("حصل خطأ أثناء تنفيذ الأمر.")
-        return
-    logger.exception("Unhandled command error", exc_info=error)
-
-
-def main() -> None:
-    token = os.getenv("BOT_TOKEN")
-    if not token:
-        raise RuntimeError(
-            "BOT_TOKEN is missing. Add the Discord bot token as a Replit Secret."
-        )
-    load_opus_library()
-    bot.run(token, log_handler=None)
-
-
-if __name__ == "__main__":
-    main()
+    @discord.ui.butt
