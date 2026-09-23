@@ -634,4 +634,21 @@ class MusicPanel(discord.ui.View):
             view=self,
         )
 
-    @discord.ui.butt
+    @discord.ui.button(
+        label="القائمة",
+        emoji="📜",
+        style=discord.ButtonStyle.secondary,
+        row=0,
+    )
+    async def show_queue(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        player = get_player(self.guild_id)
+        items = [
+            f"{index}. {track.title}"
+            for index, track in enumerate(player.queue[:10], start=1)
+        ]
+        queue_text = "\n".join(items) if items else "القائمة فارغة."
+        await interaction.response.send_message(queue_text, ephemeral=True)
