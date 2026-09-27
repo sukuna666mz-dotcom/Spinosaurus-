@@ -39,26 +39,29 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-queues = {}         # guild_id -> list of queries
+queues = {}         # guild_id -> list of (query, source) tuples
 volumes = {}        # guild_id -> float (0.1 - 1.5)
 now_playing = {}    # guild_id -> title
+now_source = {}     # guild_id -> "YouTube" or "SoundCloud" label for the current track
 panels = {}         # guild_id -> panel message
-current_query = {}  # guild_id -> query string of the track currently/last playing
+current_query = {}  # guild_id -> (query, source) tuple of the track currently/last playing
 loop_mode = {}      # guild_id -> bool, True = repeat current track forever
 
 
-def resolve(query):
+def resolve(query, source="youtube"):
     q = query.strip()
     if q.startswith("http"):
-        if "soundcloud.com" not in q:
-            raise ValueError("ساوند كلاود فقط")
-        return q
-    return f"scsearch1:{q}"
+        if "youtube.com" in q or "youtu.be" in q or "soundcloud.com" in q:
+            return q
+        raise ValueError("يدعم روابط يوتيوب وساوند كلاود فقط")
+    if source == "soundcloud":
+        return f"scsearch1:{q}"
+    return f"ytsearch1:{q}"
 
 
-def fetch_stream(query):
+def fetch_stream(query, source="youtube"):
     with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-        info = ydl.extract_info(resolve(query), download=False)
+        info = ydl.extract_info(resolve(query, source), download=False)
         if "entries" in info:
             info = info["entries"][0]
         return info["url"], info["title"]
@@ -76,6 +79,7 @@ async def delete_panel(guild_id):
 async def stop_all(guild):
     queues[guild.id] = []
     now_playing.pop(guild.id, None)
+    now_source.pop(guild.id, None)
     current_query.pop(guild.id, None)
     loop_mode[guild.id] = False
     await delete_panel(guild.id)
@@ -92,7 +96,7 @@ def build_embed(guild_id):
     embed.add_field(name="🔊 الصوت", value=f"{vol}%", inline=True)
     embed.add_field(name="📜 في الطابور", value=str(len(q)), inline=True)
     embed.add_field(name="🔂 التكرار", value="مفعّل ✅" if loop_on else "متوقف", inline=True)
-    embed.set_footer(text="SoundCloud")
+    embed.set_footer(text=now_source.get(guild_id, "YouTube"))
     return embed
 
 
@@ -165,7 +169,7 @@ class ControlPanel(discord.ui.View):
         q = queues.get(gid, [])
         if not q:
             return await interaction.response.send_message("الطابور فاضي.", ephemeral=True)
-        lines = [f"{i}. {item[:60]}" for i, item in enumerate(q[:10], 1)]
+        lines = [f"{i}. {item[0][:60]}" for i, item in enumerate(q[:10], 1)]
         if len(q) > 10:
             lines.append(f"... و{len(q) - 10} أخرى")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
@@ -193,36 +197,43 @@ async def play_next(guild, channel):
     if vc.is_playing() or vc.is_paused():
         return
 
-    query = q.pop(0)
+    query, src = q.pop(0)
     try:
-        url, title = await bot.loop.run_in_executor(None, fetch_stream, query)
+        url, title = await bot.loop.run_in_executor(None, fetch_stream, query, src)
     except Exception as e:
         await channel.send(f"❌ فشل: {e}")
         return await play_next(guild, channel)
 
     def after(err):
         if loop_mode.get(gid):
-            queues.setdefault(gid, []).insert(0, query)
+            queues.setdefault(gid, []).insert(0, (query, src))
         asyncio.run_coroutine_threadsafe(play_next(guild, channel), bot.loop)
 
-    source = discord.PCMVolumeTransformer(
+    audio_source = discord.PCMVolumeTransformer(
         discord.FFmpegPCMAudio(url, **FFMPEG_OPTS), volume=volumes.get(gid, 0.5)
     )
-    vc.play(source, after=after)
+    vc.play(audio_source, after=after)
     now_playing[gid] = title
-    current_query[gid] = query
+    now_source[gid] = "SoundCloud" if src == "soundcloud" else "YouTube"
+    current_query[gid] = (query, src)
 
     await delete_panel(gid)
     panels[gid] = await channel.send(embed=build_embed(gid), view=ControlPanel(gid))
 
 
-@bot.command(name="music", aliases=["play", "p"])
-async def music(ctx, *, query):
+def guess_source(query: str) -> str:
+    q = query.strip().lower()
+    if q.startswith("http") and "soundcloud.com" in q:
+        return "soundcloud"
+    return "youtube"
+
+
+async def queue_and_play(ctx, query, source):
     if not ctx.author.voice:
         return await ctx.send("ادخل روم صوتي أول.")
     if not ctx.voice_client:
         await ctx.author.voice.channel.connect()
-    queues.setdefault(ctx.guild.id, []).append(query)
+    queues.setdefault(ctx.guild.id, []).append((query, source))
     vc = ctx.voice_client
     if vc.is_playing() or vc.is_paused():
         await ctx.send("➕ انضافت للطابور")
@@ -233,6 +244,18 @@ async def music(ctx, *, query):
                 pass
     else:
         await play_next(ctx.guild, ctx.channel)
+
+
+@bot.command(name="music", aliases=["play", "p", "yt"])
+async def music(ctx, *, query):
+    """يشغّل من يوتيوب افتراضياً، أو من رابط ساوند كلاود لو حطيته."""
+    await queue_and_play(ctx, query, guess_source(query))
+
+
+@bot.command(name="sc", aliases=["soundcloud"])
+async def sc(ctx, *, query):
+    """يجبر البحث على ساوند كلاود فقط."""
+    await queue_and_play(ctx, query, "soundcloud")
 
 
 @bot.command(name="loop")
