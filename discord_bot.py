@@ -1,4 +1,5 @@
 import os
+import time
 import glob
 import asyncio
 import ctypes.util
@@ -65,6 +66,28 @@ def fetch_stream(query, source="youtube"):
         if "entries" in info:
             info = info["entries"][0]
         return info["url"], info["title"]
+
+
+def fetch_with_fallback(query, source):
+    """Returns (url, title, used_source). YouTube failures fall back to SoundCloud."""
+    try:
+        url, title = fetch_stream(query, source)
+        return url, title, source
+    except Exception as first_error:
+        if source != "youtube":
+            raise
+        is_link = query.strip().lower().startswith("http")
+        if is_link:
+            # A specific YouTube link: retry once (429 is often temporary)
+            time.sleep(3)
+            try:
+                url, title = fetch_stream(query, "youtube")
+                return url, title, "youtube"
+            except Exception:
+                raise first_error
+        # A text search: fall back to SoundCloud search
+        url, title = fetch_stream(query, "soundcloud")
+        return url, title, "soundcloud"
 
 
 async def delete_panel(guild_id):
@@ -199,9 +222,11 @@ async def play_next(guild, channel):
 
     query, src = q.pop(0)
     try:
-        url, title = await bot.loop.run_in_executor(None, fetch_stream, query, src)
+        url, title, src = await bot.loop.run_in_executor(
+            None, fetch_with_fallback, query, src
+        )
     except Exception as e:
-        await channel.send(f"❌ فشل: {e}")
+        await channel.send(f"❌ فشل: {str(e)[:300]}")
         return await play_next(guild, channel)
 
     def after(err):
