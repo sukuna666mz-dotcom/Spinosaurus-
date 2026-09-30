@@ -10,6 +10,18 @@ import yt_dlp
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 
+# Optional: YouTube cookies to bypass "Sign in to confirm you're not a bot".
+# Stored as a Railway variable (YT_COOKIES), never committed to GitHub.
+COOKIE_FILE = "/tmp/cookies.txt"
+_cookie_env = os.environ.get("YT_COOKIES")
+if _cookie_env:
+    with open(COOKIE_FILE, "w") as _f:
+        _f.write(_cookie_env)
+    print("YouTube cookies loaded from YT_COOKIES variable.")
+else:
+    COOKIE_FILE = None
+    print("No YT_COOKIES variable set; continuing without YouTube cookies.")
+
 
 def load_opus():
     if discord.opus.is_loaded():
@@ -31,6 +43,8 @@ def load_opus():
 
 
 YDL_OPTS = {"format": "bestaudio/best", "noplaylist": True, "quiet": True}
+if COOKIE_FILE:
+    YDL_OPTS["cookiefile"] = COOKIE_FILE
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
