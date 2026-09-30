@@ -10,18 +10,6 @@ import yt_dlp
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 
-# Optional: YouTube cookies to bypass "Sign in to confirm you're not a bot".
-# Stored as a Railway variable (YT_COOKIES), never committed to GitHub.
-COOKIE_FILE = "/tmp/cookies.txt"
-_cookie_env = os.environ.get("YT_COOKIES")
-if _cookie_env:
-    with open(COOKIE_FILE, "w") as _f:
-        _f.write(_cookie_env)
-    print("YouTube cookies loaded from YT_COOKIES variable.")
-else:
-    COOKIE_FILE = None
-    print("No YT_COOKIES variable set; continuing without YouTube cookies.")
-
 
 def load_opus():
     if discord.opus.is_loaded():
@@ -43,8 +31,6 @@ def load_opus():
 
 
 YDL_OPTS = {"format": "bestaudio/best", "noplaylist": True, "quiet": True}
-if COOKIE_FILE:
-    YDL_OPTS["cookiefile"] = COOKIE_FILE
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
@@ -92,7 +78,7 @@ def fetch_with_fallback(query, source):
             raise
         is_link = query.strip().lower().startswith("http")
         if is_link:
-            # A specific YouTube link: retry once (429 is often temporary)
+            # A specific YouTube link: retry once (temporary errors happen)
             time.sleep(3)
             try:
                 url, title = fetch_stream(query, "youtube")
@@ -173,7 +159,7 @@ class ControlPanel(discord.ui.View):
         gid = interaction.guild.id
         vc = interaction.guild.voice_client
         if vc.is_playing() or vc.is_paused():
-            loop_mode[gid] = False  # skipping cancels the loop on the current track
+            loop_mode[gid] = False
             vc.stop()
             await interaction.response.send_message("⏭️ تم التخطي", ephemeral=True)
         else:
