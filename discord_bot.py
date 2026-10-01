@@ -49,9 +49,25 @@ current_query = {}  # guild_id -> (query, source) tuple of the track currently/l
 loop_mode = {}      # guild_id -> bool, True = repeat current track forever
 
 
+BLOCKED_DOMAINS = [
+    "pornhub.com", "xvideos.com", "xnxx.com", "xhamster.com",
+    "redtube.com", "youporn.com", "spankbang.com", "tnaflix.com",
+    "motherless.com", "chaturbate.com", "onlyfans.com", "stripchat.com",
+    "brazzers.com", "txxx.com", "beeg.com", "tube8.com", "4tube.com",
+    "porntube.com", "eporner.com",
+]
+
+
+def is_blocked(url: str) -> bool:
+    u = url.strip().lower()
+    return any(domain in u for domain in BLOCKED_DOMAINS)
+
+
 def resolve(query, source="youtube"):
     q = query.strip()
     if q.startswith("http"):
+        if is_blocked(q):
+            raise ValueError("هذا الموقع غير مسموح به في هذا البوت.")
         # Any link yt-dlp supports (1800+ sites: Twitter/X, Instagram, TikTok,
         # Bandcamp, Mixcloud, Audiomack, Vimeo, Reddit, Twitch, SoundCloud,
         # YouTube...). If the site isn't supported, yt-dlp itself raises a
