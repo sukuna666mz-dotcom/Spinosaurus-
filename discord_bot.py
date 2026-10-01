@@ -52,9 +52,11 @@ loop_mode = {}      # guild_id -> bool, True = repeat current track forever
 def resolve(query, source="youtube"):
     q = query.strip()
     if q.startswith("http"):
-        if "youtube.com" in q or "youtu.be" in q or "soundcloud.com" in q:
-            return q
-        raise ValueError("يدعم روابط يوتيوب وساوند كلاود فقط")
+        # Any link yt-dlp supports (1800+ sites: Twitter/X, Instagram, TikTok,
+        # Bandcamp, Mixcloud, Audiomack, Vimeo, Reddit, Twitch, SoundCloud,
+        # YouTube...). If the site isn't supported, yt-dlp itself raises a
+        # clear error that fetch_stream/fetch_with_fallback will surface.
+        return q
     if source == "soundcloud":
         return f"scsearch1:{q}"
     return f"ytsearch1:{q}"
