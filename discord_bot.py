@@ -6,11 +6,14 @@ import asyncio
 import ctypes.util
 from collections import Counter
 
+import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 
 TOKEN = os.environ["DISCORD_TOKEN"]
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")  # optional, enables /play autocomplete
 
 
 def load_opus():
@@ -42,15 +45,22 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-queues = {}         # guild_id -> list of (query, source) tuples
-volumes = {}        # guild_id -> float (0.1 - 1.5)
-now_playing = {}    # guild_id -> title
-now_source = {}     # guild_id -> "YouTube" or "SoundCloud" label for the current track
-now_duration = {}   # guild_id -> duration in seconds (int) or None
-panels = {}         # guild_id -> panel message
-current_query = {}  # guild_id -> (query, source) tuple of the track currently/last playing
-loop_mode = {}      # guild_id -> bool, True = repeat current track forever
-play_counts = {}    # guild_id -> Counter({title: times_played})
+queues = {}          # guild_id -> list of (query, source) tuples
+volumes = {}         # guild_id -> float (0.1 - 1.5)
+now_playing = {}     # guild_id -> title
+now_source = {}      # guild_id -> "YouTube" or "SoundCloud" label for the current track
+now_duration = {}    # guild_id -> total duration in seconds (int) or None
+panels = {}          # guild_id -> panel message
+current_query = {}   # guild_id -> (query, source) tuple of the track currently/last playing
+loop_mode = {}       # guild_id -> bool, True = repeat current track forever
+play_counts = {}     # guild_id -> Counter({title: times_played})
+start_time = {}      # guild_id -> time.monotonic() when the current track started
+paused_at = {}       # guild_id -> time.monotonic() when it was paused (absent if not paused)
+paused_total = {}    # guild_id -> accumulated paused seconds for the current track
+now_url = {}         # guild_id -> cached stream URL of the current track (used for seeking)
+now_thumbnail = {}   # guild_id -> thumbnail URL of the current track
+now_meta = {}        # guild_id -> {"guild":, "channel":, "query":, "src":} for the current track
+seeking_flags = set()  # guild_ids currently mid-seek (so the `after` callback doesn't advance the queue)
 
 
 BLOCKED_DOMAINS = [
@@ -72,10 +82,6 @@ def resolve(query, source="youtube"):
     if q.startswith("http"):
         if is_blocked(q):
             raise ValueError("هذا الموقع غير مسموح به في هذا البوت.")
-        # Any link yt-dlp supports (1800+ sites: Twitter/X, Instagram, TikTok,
-        # Bandcamp, Mixcloud, Audiomack, Vimeo, Reddit, Twitch, SoundCloud,
-        # YouTube...). If the site isn't supported, yt-dlp itself raises a
-        # clear error that fetch_stream/fetch_with_fallback will surface.
         return q
     if source == "soundcloud":
         return f"scsearch1:{q}"
@@ -83,7 +89,7 @@ def resolve(query, source="youtube"):
 
 
 def format_duration(seconds):
-    if not seconds:
+    if seconds is None:
         return "—"
     seconds = int(seconds)
     h, rem = divmod(seconds, 3600)
@@ -93,34 +99,95 @@ def format_duration(seconds):
     return f"{m}:{s:02d}"
 
 
+def get_elapsed(guild_id):
+    if guild_id not in start_time:
+        return 0
+    now = time.monotonic()
+    paused_extra = (now - paused_at[guild_id]) if guild_id in paused_at else 0
+    elapsed = now - start_time[guild_id] - paused_total.get(guild_id, 0) - paused_extra
+    return max(0, elapsed)
+
+
+def mark_paused(guild_id):
+    paused_at[guild_id] = time.monotonic()
+
+
+def mark_resumed(guild_id):
+    if guild_id in paused_at:
+        paused_total[guild_id] = paused_total.get(guild_id, 0) + (time.monotonic() - paused_at[guild_id])
+        del paused_at[guild_id]
+
+
 def fetch_stream(query, source="youtube"):
     with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
         info = ydl.extract_info(resolve(query, source), download=False)
         if "entries" in info:
             info = info["entries"][0]
-        return info["url"], info["title"], info.get("duration")
+        return info["url"], info["title"], info.get("duration"), info.get("thumbnail")
 
 
 def fetch_with_fallback(query, source):
-    """Returns (url, title, duration, used_source). YouTube failures fall back to SoundCloud."""
+    """Returns (url, title, duration, thumbnail, used_source). YouTube failures fall back to SoundCloud."""
     try:
-        url, title, duration = fetch_stream(query, source)
-        return url, title, duration, source
+        url, title, duration, thumb = fetch_stream(query, source)
+        return url, title, duration, thumb, source
     except Exception as first_error:
         if source != "youtube":
             raise
         is_link = query.strip().lower().startswith("http")
         if is_link:
-            # A specific YouTube link: retry once (temporary errors happen)
             time.sleep(3)
             try:
-                url, title, duration = fetch_stream(query, "youtube")
-                return url, title, duration, "youtube"
+                url, title, duration, thumb = fetch_stream(query, "youtube")
+                return url, title, duration, thumb, "youtube"
             except Exception:
                 raise first_error
-        # A text search: fall back to SoundCloud search
-        url, title, duration = fetch_stream(query, "soundcloud")
-        return url, title, duration, "soundcloud"
+        url, title, duration, thumb = fetch_stream(query, "soundcloud")
+        return url, title, duration, thumb, "soundcloud"
+
+
+def make_audio_source(url, start_seconds=0, volume=0.5):
+    """Build a PCM audio source, optionally seeking to start_seconds into the stream."""
+    before = FFMPEG_OPTS["before_options"]
+    if start_seconds > 0:
+        before = f"-ss {int(start_seconds)} " + before
+    opts = {**FFMPEG_OPTS, "before_options": before}
+    return discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(url, **opts), volume=volume)
+
+
+async def youtube_suggest(current: str):
+    """Fast search suggestions for the /play autocomplete box (needs YOUTUBE_API_KEY)."""
+    if not current or not YOUTUBE_API_KEY:
+        return []
+    params = {
+        "part": "snippet",
+        "q": current,
+        "key": YOUTUBE_API_KEY,
+        "type": "video",
+        "maxResults": 5,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://www.googleapis.com/youtube/v3/search",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=2.5),
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+    except Exception:
+        return []
+
+    results = []
+    for item in data.get("items", []):
+        vid = item.get("id", {}).get("videoId")
+        snippet = item.get("snippet", {})
+        if not vid:
+            continue
+        label = f'{snippet.get("title", "")} — {snippet.get("channelTitle", "")}'
+        results.append((label[:100], f"https://www.youtube.com/watch?v={vid}"))
+    return results
 
 
 async def delete_panel(guild_id):
@@ -133,13 +200,21 @@ async def delete_panel(guild_id):
 
 
 async def stop_all(guild):
-    queues[guild.id] = []
-    now_playing.pop(guild.id, None)
-    now_source.pop(guild.id, None)
-    now_duration.pop(guild.id, None)
-    current_query.pop(guild.id, None)
-    loop_mode[guild.id] = False
-    await delete_panel(guild.id)
+    gid = guild.id
+    queues[gid] = []
+    now_playing.pop(gid, None)
+    now_source.pop(gid, None)
+    now_duration.pop(gid, None)
+    current_query.pop(gid, None)
+    start_time.pop(gid, None)
+    paused_at.pop(gid, None)
+    paused_total.pop(gid, None)
+    now_url.pop(gid, None)
+    now_thumbnail.pop(gid, None)
+    now_meta.pop(gid, None)
+    seeking_flags.discard(gid)
+    loop_mode[gid] = False
+    await delete_panel(gid)
     if guild.voice_client:
         await guild.voice_client.disconnect()
 
@@ -149,13 +224,17 @@ def build_embed(guild_id):
     vol = int(volumes.get(guild_id, 0.5) * 100)
     q = queues.get(guild_id, [])
     loop_on = loop_mode.get(guild_id, False)
-    duration = format_duration(now_duration.get(guild_id))
+    elapsed = format_duration(get_elapsed(guild_id))
+    total = format_duration(now_duration.get(guild_id))
     embed = discord.Embed(title="🎶 الآن يعمل", description=f"**{title}**", color=0xFF5500)
-    embed.add_field(name="⏱️ المدة", value=duration, inline=True)
+    embed.add_field(name="⏱️ الوقت", value=f"{elapsed} / {total}", inline=True)
     embed.add_field(name="🔊 الصوت", value=f"{vol}%", inline=True)
     embed.add_field(name="📜 في الطابور", value=str(len(q)), inline=True)
     embed.add_field(name="🔂 التكرار", value="مفعّل ✅" if loop_on else "متوقف", inline=True)
     embed.set_footer(text=now_source.get(guild_id, "YouTube"))
+    thumb = now_thumbnail.get(guild_id)
+    if thumb:
+        embed.set_thumbnail(url=thumb)
     return embed
 
 
@@ -190,6 +269,37 @@ class RemoveView(discord.ui.View):
         self.add_item(RemoveSelect(guild_id))
 
 
+class VolumeModal(discord.ui.Modal, title="ضبط الصوت"):
+    value = discord.ui.TextInput(
+        label="النسبة المئوية (10 إلى 150)",
+        placeholder="مثال: 70",
+        max_length=3,
+    )
+
+    def __init__(self, guild_id, panel_view):
+        super().__init__()
+        self.guild_id = guild_id
+        self.panel_view = panel_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        gid = self.guild_id
+        try:
+            num = int(str(self.value).strip())
+        except ValueError:
+            return await interaction.response.send_message("لازم تكتب رقم صحيح.", ephemeral=True)
+        vol = max(10, min(150, num)) / 100
+        volumes[gid] = vol
+        vc = interaction.guild.voice_client
+        if vc and isinstance(vc.source, discord.PCMVolumeTransformer):
+            vc.source.volume = vol
+        if gid in panels:
+            try:
+                await panels[gid].edit(embed=build_embed(gid), view=self.panel_view)
+            except Exception:
+                pass
+        await interaction.response.send_message(f"🔊 الصوت: {int(vol * 100)}%", ephemeral=True)
+
+
 class ControlPanel(discord.ui.View):
     def __init__(self, guild_id):
         super().__init__(timeout=None)
@@ -211,12 +321,15 @@ class ControlPanel(discord.ui.View):
     # Row 0
     @discord.ui.button(emoji="⏯️", label="إيقاف/تشغيل", style=discord.ButtonStyle.primary, row=0)
     async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gid = interaction.guild.id
         vc = interaction.guild.voice_client
         if vc.is_paused():
             vc.resume()
+            mark_resumed(gid)
             msg = "▶️ تم الاستئناف"
         elif vc.is_playing():
             vc.pause()
+            mark_paused(gid)
             msg = "⏸️ إيقاف مؤقت"
         else:
             msg = "ما فيه شيء يشتغل."
@@ -245,16 +358,52 @@ class ControlPanel(discord.ui.View):
             return await interaction.response.send_message("ما فيه أغنية شغالة.", ephemeral=True)
         await interaction.response.send_message(embed=build_embed(gid), ephemeral=True)
 
-    # Row 1
-    @discord.ui.button(emoji="🔉", label="أخفض", style=discord.ButtonStyle.secondary, row=1)
+    # Row 1: seek
+    @discord.ui.button(emoji="⏪", label="10 ثواني", style=discord.ButtonStyle.secondary, row=1)
+    async def seek_back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.do_seek(interaction, -10)
+
+    @discord.ui.button(emoji="⏩", label="10 ثواني", style=discord.ButtonStyle.secondary, row=1)
+    async def seek_forward(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.do_seek(interaction, +10)
+
+    async def do_seek(self, interaction: discord.Interaction, delta: int):
+        gid = interaction.guild.id
+        vc = interaction.guild.voice_client
+        if not vc or gid not in now_url:
+            return await interaction.response.send_message("ما فيه أغنية شغالة.", ephemeral=True)
+
+        new_pos = get_elapsed(gid) + delta
+        total = now_duration.get(gid)
+        new_pos = max(0, new_pos)
+        if total:
+            new_pos = min(new_pos, max(total - 2, 0))
+
+        seeking_flags.add(gid)
+        vc.stop()
+        source = make_audio_source(now_url[gid], start_seconds=new_pos, volume=volumes.get(gid, 0.5))
+        vc.play(source, after=make_after(gid))
+        start_time[gid] = time.monotonic() - new_pos
+        paused_total[gid] = 0
+        paused_at.pop(gid, None)
+
+        await interaction.response.edit_message(embed=build_embed(gid), view=self)
+
+    # Row 2
+    @discord.ui.button(emoji="🔉", label="أخفض", style=discord.ButtonStyle.secondary, row=2)
     async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.change_volume(interaction, -0.1)
 
-    @discord.ui.button(emoji="🔊", label="أعلى", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🔊", label="أعلى", style=discord.ButtonStyle.secondary, row=2)
     async def vol_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.change_volume(interaction, +0.1)
 
-    @discord.ui.button(emoji="🔂", label="تكرار", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🎚️", label="رقم", style=discord.ButtonStyle.secondary, row=2)
+    async def vol_input(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gid = interaction.guild.id
+        await interaction.response.send_modal(VolumeModal(gid, self))
+
+    @discord.ui.button(emoji="🔂", label="تكرار", style=discord.ButtonStyle.secondary, row=2)
     async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         new_state = not loop_mode.get(gid, False)
@@ -262,7 +411,7 @@ class ControlPanel(discord.ui.View):
         button.style = discord.ButtonStyle.success if new_state else discord.ButtonStyle.secondary
         await interaction.response.edit_message(embed=build_embed(gid), view=self)
 
-    @discord.ui.button(emoji="📜", label="الطابور", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="📜", label="الطابور", style=discord.ButtonStyle.secondary, row=2)
     async def show_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         q = queues.get(gid, [])
@@ -273,8 +422,8 @@ class ControlPanel(discord.ui.View):
             lines.append(f"... و{len(q) - 10} أخرى")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-    # Row 2
-    @discord.ui.button(emoji="🔀", label="خلط", style=discord.ButtonStyle.secondary, row=2)
+    # Row 3
+    @discord.ui.button(emoji="🔀", label="خلط", style=discord.ButtonStyle.secondary, row=3)
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         q = queues.get(gid, [])
@@ -288,7 +437,7 @@ class ControlPanel(discord.ui.View):
             except Exception:
                 pass
 
-    @discord.ui.button(emoji="🧹", label="تفريغ", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(emoji="🧹", label="تفريغ", style=discord.ButtonStyle.secondary, row=3)
     async def clear_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         queues[gid] = []
@@ -299,7 +448,7 @@ class ControlPanel(discord.ui.View):
             except Exception:
                 pass
 
-    @discord.ui.button(emoji="🗑️", label="حذف", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(emoji="🗑️", label="حذف", style=discord.ButtonStyle.secondary, row=3)
     async def remove_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         q = queues.get(gid, [])
@@ -319,6 +468,22 @@ class ControlPanel(discord.ui.View):
         await interaction.response.edit_message(embed=build_embed(gid), view=self)
 
 
+def make_after(gid):
+    """Returns an `after` callback for vc.play(). Shared by normal playback and seeking,
+    so seeking (which calls vc.stop()+vc.play() again) doesn't skip to the next track."""
+    def after(err):
+        if gid in seeking_flags:
+            seeking_flags.discard(gid)
+            return
+        meta = now_meta.get(gid)
+        if not meta:
+            return
+        if loop_mode.get(gid):
+            queues.setdefault(gid, []).insert(0, (meta["query"], meta["src"]))
+        asyncio.run_coroutine_threadsafe(play_next(meta["guild"], meta["channel"]), bot.loop)
+    return after
+
+
 async def play_next(guild, channel):
     gid = guild.id
     vc = guild.voice_client
@@ -334,26 +499,25 @@ async def play_next(guild, channel):
 
     query, src = q.pop(0)
     try:
-        url, title, duration, src = await bot.loop.run_in_executor(
+        url, title, duration, thumb, src = await bot.loop.run_in_executor(
             None, fetch_with_fallback, query, src
         )
     except Exception as e:
         await channel.send(f"❌ فشل: {str(e)[:300]}")
         return await play_next(guild, channel)
 
-    def after(err):
-        if loop_mode.get(gid):
-            queues.setdefault(gid, []).insert(0, (query, src))
-        asyncio.run_coroutine_threadsafe(play_next(guild, channel), bot.loop)
-
-    audio_source = discord.PCMVolumeTransformer(
-        discord.FFmpegPCMAudio(url, **FFMPEG_OPTS), volume=volumes.get(gid, 0.5)
-    )
-    vc.play(audio_source, after=after)
+    audio_source = make_audio_source(url, start_seconds=0, volume=volumes.get(gid, 0.5))
+    vc.play(audio_source, after=make_after(gid))
     now_playing[gid] = title
     now_source[gid] = "SoundCloud" if src == "soundcloud" else "YouTube"
     now_duration[gid] = duration
+    now_url[gid] = url
+    now_thumbnail[gid] = thumb
+    now_meta[gid] = {"guild": guild, "channel": channel, "query": query, "src": src}
     current_query[gid] = (query, src)
+    start_time[gid] = time.monotonic()
+    paused_total[gid] = 0
+    paused_at.pop(gid, None)
 
     play_counts.setdefault(gid, Counter())[title] += 1
 
@@ -475,6 +639,56 @@ async def top_cmd(ctx):
     await ctx.send(embed=embed)
 
 
+@bot.command(name="volume", aliases=["vol"])
+async def volume_cmd(ctx, value: int):
+    gid = ctx.guild.id
+    vol = max(10, min(150, value)) / 100
+    volumes[gid] = vol
+    vc = ctx.voice_client
+    if vc and isinstance(vc.source, discord.PCMVolumeTransformer):
+        vc.source.volume = vol
+    await ctx.send(f"🔊 الصوت: {int(vol * 100)}%")
+    if gid in panels:
+        try:
+            await panels[gid].edit(embed=build_embed(gid))
+        except Exception:
+            pass
+
+
+async def seek_command(ctx, delta):
+    gid = ctx.guild.id
+    vc = ctx.voice_client
+    if not vc or gid not in now_url:
+        return await ctx.send("ما فيه أغنية شغالة.")
+    new_pos = get_elapsed(gid) + delta
+    total = now_duration.get(gid)
+    new_pos = max(0, new_pos)
+    if total:
+        new_pos = min(new_pos, max(total - 2, 0))
+    seeking_flags.add(gid)
+    vc.stop()
+    source = make_audio_source(now_url[gid], start_seconds=new_pos, volume=volumes.get(gid, 0.5))
+    vc.play(source, after=make_after(gid))
+    start_time[gid] = time.monotonic() - new_pos
+    paused_total[gid] = 0
+    paused_at.pop(gid, None)
+    if gid in panels:
+        try:
+            await panels[gid].edit(embed=build_embed(gid))
+        except Exception:
+            pass
+
+
+@bot.command(name="forward", aliases=["fwd"])
+async def forward_cmd(ctx):
+    await seek_command(ctx, +10)
+
+
+@bot.command(name="back", aliases=["rewind"])
+async def back_cmd(ctx):
+    await seek_command(ctx, -10)
+
+
 @bot.command()
 async def skip(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
@@ -487,12 +701,14 @@ async def skip(ctx):
 async def pause(ctx):
     if ctx.voice_client:
         ctx.voice_client.pause()
+        mark_paused(ctx.guild.id)
 
 
 @bot.command()
 async def resume(ctx):
     if ctx.voice_client:
         ctx.voice_client.resume()
+        mark_resumed(ctx.guild.id)
 
 
 @bot.command()
@@ -502,9 +718,46 @@ async def stop(ctx):
         await ctx.send("⏹️ تم الإيقاف")
 
 
+# ---------- Slash command with live search suggestions (/play) ----------
+
+class CtxShim:
+    """Minimal adapter so queue_and_play() can work from a slash-command Interaction."""
+    def __init__(self, interaction: discord.Interaction):
+        self.guild = interaction.guild
+        self.author = interaction.user
+        self.channel = interaction.channel
+        self._interaction = interaction
+
+    @property
+    def voice_client(self):
+        return self.guild.voice_client
+
+    async def send(self, *args, **kwargs):
+        return await self._interaction.followup.send(*args, **kwargs)
+
+
+async def play_autocomplete(interaction: discord.Interaction, current: str):
+    suggestions = await youtube_suggest(current)
+    return [app_commands.Choice(name=label, value=url) for label, url in suggestions]
+
+
+@bot.tree.command(name="play", description="شغّل أغنية من يوتيوب أو ساوند كلاود")
+@app_commands.describe(query="اسم الأغنية أو الرابط")
+@app_commands.autocomplete(query=play_autocomplete)
+async def slash_play(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+    shim = CtxShim(interaction)
+    await queue_and_play(shim, query, guess_source(query))
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash command(s).")
+    except Exception as e:
+        print("Slash command sync failed:", e)
 
 
 load_opus()
