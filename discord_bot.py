@@ -226,12 +226,16 @@ def build_embed(guild_id):
     loop_on = loop_mode.get(guild_id, False)
     elapsed = format_duration(get_elapsed(guild_id))
     total = format_duration(now_duration.get(guild_id))
-    embed = discord.Embed(title="🎶 الآن يعمل", description=f"**{title}**", color=0xFF5500)
-    embed.add_field(name="⏱️ الوقت", value=f"{elapsed} / {total}", inline=True)
-    embed.add_field(name="🔊 الصوت", value=f"{vol}%", inline=True)
-    embed.add_field(name="📜 في الطابور", value=str(len(q)), inline=True)
-    embed.add_field(name="🔂 التكرار", value="مفعّل ✅" if loop_on else "متوقف", inline=True)
-    embed.set_footer(text=now_source.get(guild_id, "YouTube"))
+    embed = discord.Embed(
+        title="🦖 Spinosaurus يزأر الآن",
+        description=f"**{title}**",
+        color=0x2E5339,  # dark jungle green
+    )
+    embed.add_field(name="🦴 الوقت", value=f"{elapsed} / {total}", inline=True)
+    embed.add_field(name="🌿 الصوت", value=f"{vol}%", inline=True)
+    embed.add_field(name="🥚 في الطابور", value=str(len(q)), inline=True)
+    embed.add_field(name="🧬 التكرار", value="مفعّل ✅" if loop_on else "متوقف", inline=True)
+    embed.set_footer(text=f"🏝️ {now_source.get(guild_id, 'YouTube')} • من أعماق النهر")
     thumb = now_thumbnail.get(guild_id)
     if thumb:
         embed.set_thumbnail(url=thumb)
@@ -351,7 +355,7 @@ class ControlPanel(discord.ui.View):
         await interaction.response.send_message("⏹️ تم الإيقاف", ephemeral=True)
         await stop_all(interaction.guild)
 
-    @discord.ui.button(emoji="📍", label="الحالية", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="🦖", label="الحالية", style=discord.ButtonStyle.secondary, row=0)
     async def now_playing_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         if gid not in now_playing:
@@ -403,7 +407,7 @@ class ControlPanel(discord.ui.View):
         gid = interaction.guild.id
         await interaction.response.send_modal(VolumeModal(gid, self))
 
-    @discord.ui.button(emoji="🔂", label="تكرار", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(emoji="🧬", label="تكرار", style=discord.ButtonStyle.secondary, row=2)
     async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         new_state = not loop_mode.get(gid, False)
@@ -411,7 +415,7 @@ class ControlPanel(discord.ui.View):
         button.style = discord.ButtonStyle.success if new_state else discord.ButtonStyle.secondary
         await interaction.response.edit_message(embed=build_embed(gid), view=self)
 
-    @discord.ui.button(emoji="📜", label="الطابور", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(emoji="🥚", label="الطابور", style=discord.ButtonStyle.secondary, row=2)
     async def show_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         q = queues.get(gid, [])
@@ -437,7 +441,7 @@ class ControlPanel(discord.ui.View):
             except Exception:
                 pass
 
-    @discord.ui.button(emoji="🧹", label="تفريغ", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(emoji="🌋", label="تفريغ", style=discord.ButtonStyle.secondary, row=3)
     async def clear_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         queues[gid] = []
@@ -448,7 +452,7 @@ class ControlPanel(discord.ui.View):
             except Exception:
                 pass
 
-    @discord.ui.button(emoji="🗑️", label="حذف", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(emoji="🦴", label="حذف", style=discord.ButtonStyle.secondary, row=3)
     async def remove_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         q = queues.get(gid, [])
