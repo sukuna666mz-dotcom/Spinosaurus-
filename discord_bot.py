@@ -780,7 +780,8 @@ async def slash_play(interaction: discord.Interaction, query: str):
     await queue_and_play(shim, query, guess_source(query))
 
 
-# ---------- AI chat: reply when @mentioned (remembers the last few exchanges per user) ----------
+# ---------- AI chat: reply when @mentioned (shared memory per channel — everyone in
+# the channel talks to the bot in the same ongoing thread) ----------
 
 AI_SYSTEM_PROMPT = (
     "اسمك Spinosaurus، بوت دردشة وموسيقى في سيرفر ديسكورد. لو حد سألك عن اسمك أو مين "
@@ -788,18 +789,22 @@ AI_SYSTEM_PROMPT = (
     "خفيف، بترد على الكلام مش بس تنفذه، بتناقش وبتختلف مع الناس لو حسيت إن كلامهم "
     "غلط أو تافه، وما بتهزّش من أول مرة. مع كل ده لسا بتفيد وتجاوب صح، بس بأسلوبك "
     "انت مش بشكل مطيع أو رسمي. رد بالعربية إلا لو كتب لك المستخدم بلغة ثانية. خلي "
-    "ردودك مختصرة وطبيعية."
+    "ردودك مختصرة وطبيعية.\n\n"
+    "المحادثة ممكن يكون فيها أكتر من شخص بيكلموك سوا في نفس الموضوع، مش شخص واحد "
+    "بس. كل رسالة من المستخدمين هتيجيلك متبدية باسم الشخص اللي كتبها (زي 'أحمد: "
+    "سؤالي كذا')، استخدم الاسم ده عشان تفرّق بين الكلام وترد على الشخص المناسب أو "
+    "على النقاش ككل، لكن ما تكررش الاسم في بداية ردك إنت."
 )
-MAX_HISTORY_PAIRS = 3  # remember the last 3 question/answer exchanges per user
+MAX_HISTORY_MESSAGES = 16  # keep the last 16 messages of shared channel conversation
 
-conversation_history = {}  # (channel_id, user_id) -> list of {"role": "user"/"assistant", "content": str}
+conversation_history = {}  # channel_id -> list of {"role": "user"/"assistant", "content": str}
 
 
-async def ask_ai(key, prompt: str) -> str:
+async def ask_ai(channel_id, prompt: str) -> str:
     if not GROQ_API_KEY:
         return "⚠️ ميزة الدردشة مش مفعّلة بعد (محتاج GROQ_API_KEY)."
 
-    history = conversation_history.get(key, [])
+    history = conversation_history.get(channel_id, [])
     messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}] + history + [
         {"role": "user", "content": prompt}
     ]
@@ -824,7 +829,7 @@ async def ask_ai(key, prompt: str) -> str:
 
     history.append({"role": "user", "content": prompt})
     history.append({"role": "assistant", "content": reply})
-    conversation_history[key] = history[-(MAX_HISTORY_PAIRS * 2):]
+    conversation_history[channel_id] = history[-MAX_HISTORY_MESSAGES:]
     return reply
 
 
@@ -839,9 +844,10 @@ async def on_message(message: discord.Message):
             prompt = prompt.replace(f"<@{m.id}>", "").replace(f"<@!{m.id}>", "")
         prompt = prompt.strip() or "قول سلام بأسلوبك."
 
-        key = (message.channel.id, message.author.id)
+        labeled_prompt = f"{message.author.display_name}: {prompt}"
+
         async with message.channel.typing():
-            reply = await ask_ai(key, prompt)
+            reply = await ask_ai(message.channel.id, labeled_prompt)
         if len(reply) > 1900:
             reply = reply[:1900] + "…"
         await message.reply(reply, mention_author=False)
@@ -852,10 +858,9 @@ async def on_message(message: discord.Message):
 
 @bot.command(name="forget")
 async def forget_cmd(ctx):
-    """يمسح ذاكرة المحادثة بينك وبين البوت في هذه القناة."""
-    key = (ctx.channel.id, ctx.author.id)
-    conversation_history.pop(key, None)
-    await ctx.send("🧠 تم مسح ذاكرة محادثتنا.")
+    """يمسح ذاكرة محادثة البوت مع الكل في هذه القناة."""
+    conversation_history.pop(ctx.channel.id, None)
+    await ctx.send("🧠 تم مسح ذاكرة المحادثة في القناة دي.")
 
 
 @bot.event
