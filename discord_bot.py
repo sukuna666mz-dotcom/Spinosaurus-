@@ -15,7 +15,7 @@ import yt_dlp
 TOKEN = os.environ["DISCORD_TOKEN"]
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")  # optional, enables /play autocomplete
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")  # optional, enables @mention AI chat (free at console.groq.com)
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 
 def load_opus():
