@@ -14,6 +14,8 @@ import yt_dlp
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")  # optional, enables /play autocomplete
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")  # optional, enables @mention AI chat (free at console.groq.com)
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
 def load_opus():
@@ -385,8 +387,15 @@ class ControlPanel(discord.ui.View):
 
         seeking_flags.add(gid)
         vc.stop()
+        if not vc.is_connected():
+            seeking_flags.discard(gid)
+            return await interaction.response.send_message("البوت ماعاد متصل بالروم.", ephemeral=True)
         source = make_audio_source(now_url[gid], start_seconds=new_pos, volume=volumes.get(gid, 0.5))
-        vc.play(source, after=make_after(gid))
+        try:
+            vc.play(source, after=make_after(gid))
+        except discord.ClientException:
+            seeking_flags.discard(gid)
+            return await interaction.response.send_message("البوت ماعاد متصل بالروم.", ephemeral=True)
         start_time[gid] = time.monotonic() - new_pos
         paused_total[gid] = 0
         paused_at.pop(gid, None)
@@ -510,8 +519,18 @@ async def play_next(guild, channel):
         await channel.send(f"❌ فشل: {str(e)[:300]}")
         return await play_next(guild, channel)
 
+    # The bot may have been disconnected from voice while fetch_with_fallback() was
+    # running (someone kicked it, left it alone, or the connection dropped). Re-check
+    # right before playing instead of letting ClientException bubble up as a crash log.
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        return
+
     audio_source = make_audio_source(url, start_seconds=0, volume=volumes.get(gid, 0.5))
-    vc.play(audio_source, after=make_after(gid))
+    try:
+        vc.play(audio_source, after=make_after(gid))
+    except discord.ClientException:
+        return
     now_playing[gid] = title
     now_source[gid] = "SoundCloud" if src == "soundcloud" else "YouTube"
     now_duration[gid] = duration
@@ -671,8 +690,15 @@ async def seek_command(ctx, delta):
         new_pos = min(new_pos, max(total - 2, 0))
     seeking_flags.add(gid)
     vc.stop()
+    if not vc.is_connected():
+        seeking_flags.discard(gid)
+        return await ctx.send("البوت ماعاد متصل بالروم.")
     source = make_audio_source(now_url[gid], start_seconds=new_pos, volume=volumes.get(gid, 0.5))
-    vc.play(source, after=make_after(gid))
+    try:
+        vc.play(source, after=make_after(gid))
+    except discord.ClientException:
+        seeking_flags.discard(gid)
+        return await ctx.send("البوت ماعاد متصل بالروم.")
     start_time[gid] = time.monotonic() - new_pos
     paused_total[gid] = 0
     paused_at.pop(gid, None)
@@ -752,6 +778,65 @@ async def slash_play(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
     shim = CtxShim(interaction)
     await queue_and_play(shim, query, guess_source(query))
+
+
+# ---------- AI chat: reply when @mentioned (stateless, free via Groq) ----------
+
+async def ask_ai(prompt: str) -> str:
+    if not GROQ_API_KEY:
+        return "⚠️ ميزة الدردشة مش مفعّلة بعد (محتاج GROQ_API_KEY)."
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "أنت بوت دردشة ودود في سيرفر ديسكورد. رد بالعربية إلا لو كتب لك "
+                    "المستخدم بلغة ثانية. خلي ردودك مختصرة وطبيعية، بدون رسمية زايدة."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 600,
+        "temperature": 0.7,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                data = await resp.json()
+                if resp.status != 200:
+                    err = data.get("error", {}).get("message", "خطأ غير معروف")
+                    return f"⚠️ تعذر الرد: {err[:200]}"
+                return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"⚠️ خطأ بالاتصال: {str(e)[:200]}"
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    if bot.user in message.mentions:
+        prompt = message.content
+        for m in message.mentions:
+            prompt = prompt.replace(f"<@{m.id}>", "").replace(f"<@!{m.id}>", "")
+        prompt = prompt.strip() or "قول سلام بأسلوبك."
+
+        async with message.channel.typing():
+            reply = await ask_ai(prompt)
+        if len(reply) > 1900:
+            reply = reply[:1900] + "…"
+        await message.reply(reply, mention_author=False)
+        return  # don't also treat this as a ! command
+
+    await bot.process_commands(message)
 
 
 @bot.event
