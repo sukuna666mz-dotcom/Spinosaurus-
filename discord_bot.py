@@ -780,27 +780,29 @@ async def slash_play(interaction: discord.Interaction, query: str):
     await queue_and_play(shim, query, guess_source(query))
 
 
-# ---------- AI chat: reply when @mentioned (stateless, free via Groq) ----------
+# ---------- AI chat: reply when @mentioned (remembers the last few exchanges per user) ----------
 
-async def ask_ai(prompt: str) -> str:
+AI_SYSTEM_PROMPT = (
+    "اسمك Spinosaurus، بوت دردشة وموسيقى ودود في سيرفر ديسكورد. لو حد سألك عن اسمك "
+    "أو مين أنت، رد إنك Spinosaurus. رد بالعربية إلا لو كتب لك المستخدم بلغة ثانية. "
+    "خلي ردودك مختصرة وطبيعية، بدون رسمية زايدة."
+)
+MAX_HISTORY_PAIRS = 3  # remember the last 3 question/answer exchanges per user
+
+conversation_history = {}  # (channel_id, user_id) -> list of {"role": "user"/"assistant", "content": str}
+
+
+async def ask_ai(key, prompt: str) -> str:
     if not GROQ_API_KEY:
         return "⚠️ ميزة الدردشة مش مفعّلة بعد (محتاج GROQ_API_KEY)."
+
+    history = conversation_history.get(key, [])
+    messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}] + history + [
+        {"role": "user", "content": prompt}
+    ]
+
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "أنت بوت دردشة ودود في سيرفر ديسكورد. رد بالعربية إلا لو كتب لك "
-                    "المستخدم بلغة ثانية. خلي ردودك مختصرة وطبيعية، بدون رسمية زايدة."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": 600,
-        "temperature": 0.7,
-    }
+    payload = {"model": GROQ_MODEL, "messages": messages, "max_tokens": 600, "temperature": 0.7}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -813,9 +815,14 @@ async def ask_ai(prompt: str) -> str:
                 if resp.status != 200:
                     err = data.get("error", {}).get("message", "خطأ غير معروف")
                     return f"⚠️ تعذر الرد: {err[:200]}"
-                return data["choices"][0]["message"]["content"].strip()
+                reply = data["choices"][0]["message"]["content"].strip()
     except Exception as e:
         return f"⚠️ خطأ بالاتصال: {str(e)[:200]}"
+
+    history.append({"role": "user", "content": prompt})
+    history.append({"role": "assistant", "content": reply})
+    conversation_history[key] = history[-(MAX_HISTORY_PAIRS * 2):]
+    return reply
 
 
 @bot.event
@@ -829,14 +836,23 @@ async def on_message(message: discord.Message):
             prompt = prompt.replace(f"<@{m.id}>", "").replace(f"<@!{m.id}>", "")
         prompt = prompt.strip() or "قول سلام بأسلوبك."
 
+        key = (message.channel.id, message.author.id)
         async with message.channel.typing():
-            reply = await ask_ai(prompt)
+            reply = await ask_ai(key, prompt)
         if len(reply) > 1900:
             reply = reply[:1900] + "…"
         await message.reply(reply, mention_author=False)
         return  # don't also treat this as a ! command
 
     await bot.process_commands(message)
+
+
+@bot.command(name="forget")
+async def forget_cmd(ctx):
+    """يمسح ذاكرة المحادثة بينك وبين البوت في هذه القناة."""
+    key = (ctx.channel.id, ctx.author.id)
+    conversation_history.pop(key, None)
+    await ctx.send("🧠 تم مسح ذاكرة محادثتنا.")
 
 
 @bot.event
