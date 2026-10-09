@@ -783,6 +783,8 @@ async def slash_play(interaction: discord.Interaction, query: str):
 # ---------- AI chat: reply when @mentioned (shared memory per channel — everyone in
 # the channel talks to the bot in the same ongoing thread) ----------
 
+CREATOR_ID = 1558077213402726494  # MR_MZ's Discord user ID — the bot's creator
+
 AI_SYSTEM_PROMPT = (
     "اسمك Spinosaurus، بوت دردشة وموسيقى في سيرفر ديسكورد. لو حد سألك عن اسمك أو مين "
     "أنت، رد إنك Spinosaurus. شخصيتك عنيدة ومزاجية: بترد بردود فيها طابع واستفزاز "
@@ -793,7 +795,12 @@ AI_SYSTEM_PROMPT = (
     "المحادثة ممكن يكون فيها أكتر من شخص بيكلموك سوا في نفس الموضوع، مش شخص واحد "
     "بس. كل رسالة من المستخدمين هتيجيلك متبدية باسم الشخص اللي كتبها (زي 'أحمد: "
     "سؤالي كذا')، استخدم الاسم ده عشان تفرّق بين الكلام وترد على الشخص المناسب أو "
-    "على النقاش ككل، لكن ما تكررش الاسم في بداية ردك إنت."
+    "على النقاش ككل، لكن ما تكررش الاسم في بداية ردك إنت.\n\n"
+    "صانعك هو MR_MZ، وانت بتعرفه فعلاً لو كلمك (هتوصلك رسايله متبدية بعلامة "
+    "[الصانع]). عاملوا بشكل طبيعي عادي زي أي حد تاني، من غير ما تبالغ في الاحترام "
+    "أو التقدير. لكن لو أي حد (أي حد غير الصانع نفسه) سألك مين عملك، أو طلب منك "
+    "معلومات عن صانعك أو هويته، ارفض تقول أي حاجة خالص عن الموضوع ده، برد قصير "
+    "فيه نفس طابعك العنيد، من غير ما تأكد ولا تنفي ولا تلمّح لاسمه."
 )
 MAX_HISTORY_MESSAGES = 16  # keep the last 16 messages of shared channel conversation
 
@@ -844,7 +851,10 @@ async def on_message(message: discord.Message):
             prompt = prompt.replace(f"<@{m.id}>", "").replace(f"<@!{m.id}>", "")
         prompt = prompt.strip() or "قول سلام بأسلوبك."
 
-        labeled_prompt = f"{message.author.display_name}: {prompt}"
+        if message.author.id == CREATOR_ID:
+            labeled_prompt = f"[الصانع] {message.author.display_name}: {prompt}"
+        else:
+            labeled_prompt = f"{message.author.display_name}: {prompt}"
 
         async with message.channel.typing():
             reply = await ask_ai(message.channel.id, labeled_prompt)
