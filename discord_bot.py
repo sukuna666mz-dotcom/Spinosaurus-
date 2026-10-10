@@ -920,10 +920,18 @@ def contains_stop_phrase(text: str) -> bool:
     return any(p in t for p in STOP_PHRASES)
 
 
+ai_chat_enabled = True  # global on/off switch — !ai_off / !ai_on (creator only)
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.id == bot.user.id:
         return  # never reply to ourselves
+
+    if not ai_chat_enabled:
+        if not message.author.bot:
+            await bot.process_commands(message)
+        return
 
     if message.author.bot:
         if message.author.id != TARGET_BOT_ID:
@@ -956,6 +964,26 @@ async def on_message(message: discord.Message):
     if len(reply) > 1900:
         reply = reply[:1900] + "…"
     await message.reply(reply, mention_author=False)
+
+
+@bot.command(name="ai_off")
+async def ai_off_cmd(ctx):
+    """يطفي كل حديث البوت بالذكاء الاصطناعي (مع البشر ومع البوت التاني). بس الصانع."""
+    global ai_chat_enabled
+    if ctx.author.id != CREATOR_ID:
+        return await ctx.send("مش من حقك تطفيني.")
+    ai_chat_enabled = False
+    await ctx.send("🔇 طفيت. مش هرد على حد لحد ما حد يشغّلني تاني بـ !ai_on")
+
+
+@bot.command(name="ai_on")
+async def ai_on_cmd(ctx):
+    """يرجّع تشغيل حديث البوت بالذكاء الاصطناعي. بس الصانع."""
+    global ai_chat_enabled
+    if ctx.author.id != CREATOR_ID:
+        return await ctx.send("مش من حقك تشغّلني.")
+    ai_chat_enabled = True
+    await ctx.send("🔊 تمام، رجعت أرد.")
 
 
 @bot.command(name="whoami")
