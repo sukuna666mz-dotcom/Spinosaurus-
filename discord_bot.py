@@ -922,9 +922,9 @@ async def on_message(message: discord.Message):
 
     if message.author.bot:
         if message.channel.id in muted_bot_chat_channels:
-            return  # a human told the bots to stop — stay quiet until !resume
-        if bot.user not in message.mentions:
-            return  # ignore other bots unless they specifically mention us
+            return  # a human told the bots to stop — stay quiet until !unmute_chat
+        if not message.content.strip():
+            return  # nothing to react to (e.g. an embed-only message)
     else:
         if contains_stop_phrase(message.content):
             muted_bot_chat_channels.add(message.channel.id)
