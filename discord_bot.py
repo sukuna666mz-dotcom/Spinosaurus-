@@ -37,10 +37,21 @@ def load_opus():
     print("WARNING: Opus not loaded, voice may fail")
 
 
-YDL_OPTS = {"format": "bestaudio/best", "noplaylist": True, "quiet": True}
+YDL_OPTS = {
+    # Prefer native Opus audio (YouTube/SoundCloud's highest-quality audio stream)
+    # before falling back to whatever the best available audio track is.
+    "format": "bestaudio[acodec^=opus]/bestaudio/best",
+    "noplaylist": True,
+    "quiet": True,
+}
 FFMPEG_OPTS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
+    "before_options": (
+        "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+        "-reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx"
+    ),
+    # -ar/-ac match Discord's required 48kHz stereo PCM exactly, avoiding any
+    # unnecessary extra resampling pass.
+    "options": "-vn -ar 48000 -ac 2",
 }
 
 intents = discord.Intents.default()
@@ -79,6 +90,12 @@ def is_blocked(url: str) -> bool:
     return any(domain in u for domain in BLOCKED_DOMAINS)
 
 
+SEARCH_RESULT_COUNT = 5  # candidates to compare per text search, instead of blindly taking #1
+BAD_TITLE_KEYWORDS = ["reaction", "tutorial", "ردة فعل", "شرح", "تعليق", "لايف", "live", "مباشر"]
+LONG_TRACK_SECONDS = 20 * 60  # 20 minutes — likely a compilation/mix/full album, not a single song
+LONG_TRACK_ALLOW_WORDS = ["mix", "full album", "ميكس", "البوم كامل", "كامله", "كاملة", "playlist"]
+
+
 def resolve(query, source="youtube"):
     q = query.strip()
     if q.startswith("http"):
@@ -86,8 +103,44 @@ def resolve(query, source="youtube"):
             raise ValueError("هذا الموقع غير مسموح به في هذا البوت.")
         return q
     if source == "soundcloud":
-        return f"scsearch1:{q}"
-    return f"ytsearch1:{q}"
+        return f"scsearch{SEARCH_RESULT_COUNT}:{q}"
+    return f"ytsearch{SEARCH_RESULT_COUNT}:{q}"
+
+
+def score_search_result(entry, original_query: str) -> int:
+    """Higher is better. Penalizes likely-irrelevant results instead of blindly using #1."""
+    score = 0
+    title = (entry.get("title") or "").lower()
+    q = original_query.lower()
+
+    if any(bad in title for bad in BAD_TITLE_KEYWORDS) and not any(bad in q for bad in BAD_TITLE_KEYWORDS):
+        score -= 5
+
+    duration = entry.get("duration") or 0
+    if duration > LONG_TRACK_SECONDS and not any(w in q for w in LONG_TRACK_ALLOW_WORDS):
+        score -= 4
+    elif 30 <= duration <= 600:  # a normal single-track length is a good sign
+        score += 1
+
+    # A channel/uploader whose name is closer to the query is often the official source.
+    uploader = (entry.get("uploader") or entry.get("channel") or "").lower()
+    if uploader and any(word in uploader for word in q.split() if len(word) > 2):
+        score += 1
+
+    return score
+
+
+def pick_best_entry(entries, original_query: str):
+    candidates = [e for e in entries if e]
+    if not candidates:
+        raise ValueError("ما فيه نتائج.")
+    # Keep original search ranking as a tiebreaker (earlier = slightly better by default).
+    scored = sorted(
+        enumerate(candidates),
+        key=lambda pair: (score_search_result(pair[1], original_query), -pair[0]),
+        reverse=True,
+    )
+    return scored[0][1]
 
 
 def format_duration(seconds):
@@ -124,18 +177,28 @@ def fetch_stream(query, source="youtube"):
     with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
         info = ydl.extract_info(resolve(query, source), download=False)
         if "entries" in info:
-            info = info["entries"][0]
+            info = pick_best_entry(info["entries"], query)
         return info["url"], info["title"], info.get("duration"), info.get("thumbnail")
 
 
 def fetch_with_fallback(query, source):
-    """Returns (url, title, duration, thumbnail, used_source). YouTube failures fall back to SoundCloud."""
+    """Returns (url, title, duration, thumbnail, used_source).
+    Retries once on transient errors, then falls back YouTube -> SoundCloud."""
     try:
         url, title, duration, thumb = fetch_stream(query, source)
         return url, title, duration, thumb, source
     except Exception as first_error:
+        # Transient network/extractor hiccups are common with live streaming — one
+        # quick retry on the same source clears up most of them before we give up on it.
+        time.sleep(2)
+        try:
+            url, title, duration, thumb = fetch_stream(query, source)
+            return url, title, duration, thumb, source
+        except Exception:
+            pass
+
         if source != "youtube":
-            raise
+            raise first_error
         is_link = query.strip().lower().startswith("http")
         if is_link:
             time.sleep(3)
@@ -485,6 +548,8 @@ def make_after(gid):
     """Returns an `after` callback for vc.play(). Shared by normal playback and seeking,
     so seeking (which calls vc.stop()+vc.play() again) doesn't skip to the next track."""
     def after(err):
+        if err:
+            print(f"Playback error in guild {gid}: {err}")
         if gid in seeking_flags:
             seeking_flags.discard(gid)
             return
@@ -840,30 +905,50 @@ async def ask_ai(channel_id, prompt: str) -> str:
     return reply
 
 
+muted_bot_chat_channels = set()  # channel_ids where a human told the bots to stop talking to each other
+
+STOP_PHRASES = ["اسكت", "اسكتوا", "اسكتو", "وقف", "وقفوا", "كفايه", "كفاية", "bas", "stop"]
+
+
+def contains_stop_phrase(text: str) -> bool:
+    t = text.strip().lower()
+    return any(p in t for p in STOP_PHRASES)
+
+
 @bot.event
 async def on_message(message: discord.Message):
+    if message.author.id == bot.user.id:
+        return  # never reply to ourselves
+
     if message.author.bot:
-        return
+        if message.channel.id in muted_bot_chat_channels:
+            return  # a human told the bots to stop — stay quiet until !resume
+        if bot.user not in message.mentions:
+            return  # ignore other bots unless they specifically mention us
+    else:
+        if contains_stop_phrase(message.content):
+            muted_bot_chat_channels.add(message.channel.id)
+        if bot.user not in message.mentions:
+            await bot.process_commands(message)
+            return
 
-    if bot.user in message.mentions:
-        prompt = message.content
-        for m in message.mentions:
-            prompt = prompt.replace(f"<@{m.id}>", "").replace(f"<@!{m.id}>", "")
-        prompt = prompt.strip() or "قول سلام بأسلوبك."
+    prompt = message.content
+    for m in message.mentions:
+        prompt = prompt.replace(f"<@{m.id}>", "").replace(f"<@!{m.id}>", "")
+    prompt = prompt.strip() or "قول سلام بأسلوبك."
 
-        if message.author.id == CREATOR_ID:
-            labeled_prompt = f"[الصانع] {message.author.display_name}: {prompt}"
-        else:
-            labeled_prompt = f"{message.author.display_name}: {prompt}"
+    if message.author.id == CREATOR_ID:
+        labeled_prompt = f"[الصانع] {message.author.display_name}: {prompt}"
+    elif message.author.bot:
+        labeled_prompt = f"[بوت آخر] {message.author.display_name}: {prompt}"
+    else:
+        labeled_prompt = f"{message.author.display_name}: {prompt}"
 
-        async with message.channel.typing():
-            reply = await ask_ai(message.channel.id, labeled_prompt)
-        if len(reply) > 1900:
-            reply = reply[:1900] + "…"
-        await message.reply(reply, mention_author=False)
-        return  # don't also treat this as a ! command
-
-    await bot.process_commands(message)
+    async with message.channel.typing():
+        reply = await ask_ai(message.channel.id, labeled_prompt)
+    if len(reply) > 1900:
+        reply = reply[:1900] + "…"
+    await message.reply(reply, mention_author=False)
 
 
 @bot.command(name="forget")
@@ -871,6 +956,13 @@ async def forget_cmd(ctx):
     """يمسح ذاكرة محادثة البوت مع الكل في هذه القناة."""
     conversation_history.pop(ctx.channel.id, None)
     await ctx.send("🧠 تم مسح ذاكرة المحادثة في القناة دي.")
+
+
+@bot.command(name="resume")
+async def resume_cmd(ctx):
+    """يرجّع البوت يرد على باقي البوتات في القناة دي بعد ما كان مسكوت."""
+    muted_bot_chat_channels.discard(ctx.channel.id)
+    await ctx.send("🗣️ تمام، رجعت أتكلم.")
 
 
 @bot.event
