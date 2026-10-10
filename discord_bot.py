@@ -848,7 +848,7 @@ async def slash_play(interaction: discord.Interaction, query: str):
 # ---------- AI chat: reply when @mentioned (shared memory per channel — everyone in
 # the channel talks to the bot in the same ongoing thread) ----------
 
-CREATOR_ID = 1558077213402726494  # MR_MZ's Discord user ID — the bot's creator
+CREATOR_ID = 1320087735242981406  # MR_MZ's Discord user ID — the bot's creator
 
 AI_SYSTEM_PROMPT = (
     "اسمك Spinosaurus، بوت دردشة وموسيقى في سيرفر ديسكورد. لو حد سألك عن اسمك أو مين "
