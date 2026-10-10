@@ -958,6 +958,17 @@ async def on_message(message: discord.Message):
     await message.reply(reply, mention_author=False)
 
 
+@bot.command(name="whoami")
+async def whoami_cmd(ctx):
+    """يورّيك الـ ID اللي البوت شايفه ليك، عشان تقارنه بـ CREATOR_ID."""
+    is_creator = ctx.author.id == CREATOR_ID
+    await ctx.send(
+        f"الـ ID بتاعك: `{ctx.author.id}`\n"
+        f"CREATOR_ID المسجّل: `{CREATOR_ID}`\n"
+        f"متطابقين: {'✅' if is_creator else '❌'}"
+    )
+
+
 @bot.command(name="say")
 async def say_cmd(ctx, *, text):
     """يخلي البوت يقول أي كلام (بس الصانع يقدر يستخدمه)."""
