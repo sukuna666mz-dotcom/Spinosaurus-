@@ -958,8 +958,8 @@ async def forget_cmd(ctx):
     await ctx.send("🧠 تم مسح ذاكرة المحادثة في القناة دي.")
 
 
-@bot.command(name="resume")
-async def resume_cmd(ctx):
+@bot.command(name="unmute_chat", aliases=["speak"])
+async def unmute_chat_cmd(ctx):
     """يرجّع البوت يرد على باقي البوتات في القناة دي بعد ما كان مسكوت."""
     muted_bot_chat_channels.discard(ctx.channel.id)
     await ctx.send("🗣️ تمام، رجعت أتكلم.")
