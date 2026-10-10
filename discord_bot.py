@@ -907,10 +907,12 @@ async def ask_ai(channel_id, prompt: str) -> str:
 
 muted_bot_chat_channels = set()  # channel_ids where a human told the bots to stop talking to each other
 
-STOP_PHRASES = [
-    "اسكت", "اسكتوا", "اسكتو", "وقف", "وقفوا", "قف", "توقف", "توقفوا",
-    "كفايه", "كفاية", "bas", "stop", "quiet", "shut up",
-]
+STOP_PHRASES = ["اسكت", "اسكتوا", "اسكتو", "وقف", "وقفوا", "كفايه", "كفاية", "bas", "stop"]
+
+# Only this specific bot is allowed to auto-chat with us (name#discriminator, exactly
+# as it appears in Discord). Every other bot is ignored to avoid burning the daily
+# Groq token quota by replying to every bot in the server.
+TARGET_BOT_ID = 1424159433537228852  # Tokyo | System. — the only bot we auto-chat with
 
 
 def contains_stop_phrase(text: str) -> bool:
@@ -918,8 +920,30 @@ def contains_stop_phrase(text: str) -> bool:
     return any(p in t for p in STOP_PHRASES)
 
 
-async def handle_ai_reply(message: discord.Message, prompt: str):
-    """Shared helper: label the speaker, call the AI, and reply with a mention."""
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.id == bot.user.id:
+        return  # never reply to ourselves
+
+    if message.author.bot:
+        if message.author.id != TARGET_BOT_ID:
+            return  # ignore every bot except the one specified
+        if message.channel.id in muted_bot_chat_channels:
+            return  # a human told the bots to stop — stay quiet until !unmute_chat
+        if not message.content.strip():
+            return  # nothing to react to (e.g. an embed-only message)
+    else:
+        if contains_stop_phrase(message.content):
+            muted_bot_chat_channels.add(message.channel.id)
+        if bot.user not in message.mentions:
+            await bot.process_commands(message)
+            return
+
+    prompt = message.content
+    for m in message.mentions:
+        prompt = prompt.replace(f"<@{m.id}>", "").replace(f"<@!{m.id}>", "")
+    prompt = prompt.strip() or "قول سلام بأسلوبك."
+
     if message.author.id == CREATOR_ID:
         labeled_prompt = f"[الصانع] {message.author.display_name}: {prompt}"
     elif message.author.bot:
@@ -931,52 +955,19 @@ async def handle_ai_reply(message: discord.Message, prompt: str):
         reply = await ask_ai(message.channel.id, labeled_prompt)
     if len(reply) > 1900:
         reply = reply[:1900] + "…"
-    # Always mention the person the bot is talking to
-    await message.reply(reply, mention_author=True)
+    await message.reply(reply, mention_author=False)
 
 
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.id == bot.user.id:
-        return  # never reply to ourselves
-
-    if message.author.bot:
-        # Bot-to-bot conversation: only if the channel is not muted
-        if message.channel.id in muted_bot_chat_channels:
-            return  # a human told the bots to stop — stay quiet until !unmute_chat
-        if not message.content.strip():
-            return  # nothing to react to (e.g. an embed-only message)
-        # Proceed to AI reply for other bots
-    else:
-        # Human messages
-        if contains_stop_phrase(message.content):
-            muted_bot_chat_channels.add(message.channel.id)
-            # Still process normal commands, but don't force an AI reply just for the stop phrase
-            await bot.process_commands(message)
-            return
-        if bot.user not in message.mentions:
-            await bot.process_commands(message)
-            return
-
-    # Clean the prompt (remove mentions)
-    prompt = message.content
-    for m in message.mentions:
-        prompt = prompt.replace(f"<@{m.id}>", "").replace(f"<@!{m.id}>", "")
-    prompt = prompt.strip() or "قول سلام بأسلوبك."
-
-    await handle_ai_reply(message, prompt)
-
-
-@bot.command(name="chat", aliases=["ask", "ai", "قول"])
-async def chat_cmd(ctx, *, prompt: str):
-    """تكلم مع البوت مباشرة بدون منشن.
-    مثال: !chat كيف حالك؟ أو !ask وش رأيك؟
-    """
-    if not prompt.strip():
-        return await ctx.send("اكتب حاجة بعد الأمر يا صاحبي.")
-    # Re-use the same AI path so history + personality stay consistent
-    # Build a fake message-like object isn't needed; we call the helper with the real message
-    await handle_ai_reply(ctx.message, prompt.strip())
+@bot.command(name="say")
+async def say_cmd(ctx, *, text):
+    """يخلي البوت يقول أي كلام (بس الصانع يقدر يستخدمه)."""
+    if ctx.author.id != CREATOR_ID:
+        return await ctx.send("مش من حقك تخليني أقول أي حاجة.")
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+    await ctx.send(text)
 
 
 @bot.command(name="forget")
