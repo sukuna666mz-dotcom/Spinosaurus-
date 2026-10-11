@@ -909,11 +909,6 @@ muted_bot_chat_channels = set()  # channel_ids where a human told the bots to st
 
 STOP_PHRASES = ["اسكت", "اسكتوا", "اسكتو", "وقف", "وقفوا", "كفايه", "كفاية", "bas", "stop"]
 
-# Only this specific bot is allowed to auto-chat with us (name#discriminator, exactly
-# as it appears in Discord). Every other bot is ignored to avoid burning the daily
-# Groq token quota by replying to every bot in the server.
-TARGET_BOT_ID = 1424159433537228852  # Tokyo | System. — the only bot we auto-chat with
-
 
 def contains_stop_phrase(text: str) -> bool:
     t = text.strip().lower()
@@ -934,12 +929,10 @@ async def on_message(message: discord.Message):
         return
 
     if message.author.bot:
-        if message.author.id != TARGET_BOT_ID:
-            return  # ignore every bot except the one specified
+        if bot.user not in message.mentions:
+            return  # ignore bots unless they specifically mention us
         if message.channel.id in muted_bot_chat_channels:
             return  # a human told the bots to stop — stay quiet until !unmute_chat
-        if not message.content.strip():
-            return  # nothing to react to (e.g. an embed-only message)
     else:
         if contains_stop_phrase(message.content):
             muted_bot_chat_channels.add(message.channel.id)
