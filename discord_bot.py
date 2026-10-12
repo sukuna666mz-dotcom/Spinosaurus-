@@ -923,6 +923,12 @@ async def on_message(message: discord.Message):
     if message.author.id == bot.user.id:
         return  # never reply to ourselves
 
+    if any(m.id == CREATOR_ID for m in message.mentions):
+        try:
+            await message.add_reaction("🦖")
+        except Exception:
+            pass
+
     if not ai_chat_enabled:
         if not message.author.bot:
             await bot.process_commands(message)
