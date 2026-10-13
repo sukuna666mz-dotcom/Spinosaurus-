@@ -1,9 +1,14 @@
 import os
+import re
+import json
 import time
 import glob
 import random
+import difflib
 import asyncio
 import ctypes.util
+import urllib.request
+import urllib.parse
 from collections import Counter
 
 import aiohttp
@@ -16,6 +21,7 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")  # optional, enables /play autocomplete
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")  # optional, enables @mention AI chat (free at console.groq.com)
 GROQ_MODEL = "openai/gpt-oss-120b"
+LIBRARY_CHANNEL_ID = int(os.environ["LIBRARY_CHANNEL_ID"]) if os.environ.get("LIBRARY_CHANNEL_ID") else None
 
 
 def load_opus():
@@ -75,6 +81,8 @@ now_thumbnail = {}   # guild_id -> thumbnail URL of the current track
 now_meta = {}        # guild_id -> {"guild":, "channel":, "query":, "src":} for the current track
 seeking_flags = set()  # guild_ids currently mid-seek (so the `after` callback doesn't advance the queue)
 
+music_library = {}  # normalized_title -> {"title": str, "url": str, "duration": int|None}
+
 
 BLOCKED_DOMAINS = [
     "pornhub.com", "xvideos.com", "xnxx.com", "xhamster.com",
@@ -90,10 +98,28 @@ def is_blocked(url: str) -> bool:
     return any(domain in u for domain in BLOCKED_DOMAINS)
 
 
-SEARCH_RESULT_COUNT = 5  # candidates to compare per text search, instead of blindly taking #1
-BAD_TITLE_KEYWORDS = ["reaction", "tutorial", "ردة فعل", "شرح", "تعليق", "لايف", "live", "مباشر"]
+SEARCH_RESULT_COUNT = 8  # candidates to compare per text search, instead of blindly taking #1
+
+# Words that usually signal a "different version" of the song, not the one people mean
+# by default. Each is only penalized if the person didn't explicitly ask for it.
+UNWANTED_VERSION_WORDS = [
+    "cover", "remix", "instrumental", "karaoke", "8d audio", "nightcore",
+    "slowed", "sped up", "reverb", "acoustic", "live", "reaction",
+    "tutorial", "lesson", "ringtone",
+    "كفر", "ريمكس", "بدون كلمات", "كاريوكي", "بطيء", "مسرع", "ردة فعل",
+    "شرح", "تعليق", "لايف", "مباشر", "نغمة",
+]
+
 LONG_TRACK_SECONDS = 20 * 60  # 20 minutes — likely a compilation/mix/full album, not a single song
 LONG_TRACK_ALLOW_WORDS = ["mix", "full album", "ميكس", "البوم كامل", "كامله", "كاملة", "playlist"]
+
+_WORD_RE = re.compile(r"[\w\u0600-\u06FF]+")
+_STOPWORDS = {"the", "a", "an", "of", "feat", "ft", "official", "video", "audio", "song"}
+
+
+def _tokenize(text: str) -> set:
+    words = _WORD_RE.findall(text.lower())
+    return {w for w in words if w not in _STOPWORDS and len(w) > 1}
 
 
 def resolve(query, source="youtube"):
@@ -107,25 +133,33 @@ def resolve(query, source="youtube"):
     return f"ytsearch{SEARCH_RESULT_COUNT}:{q}"
 
 
-def score_search_result(entry, original_query: str) -> int:
-    """Higher is better. Penalizes likely-irrelevant results instead of blindly using #1."""
-    score = 0
-    title = (entry.get("title") or "").lower()
+def score_search_result(entry, original_query: str) -> float:
+    """Higher is better. The main signal is how many of the query's words actually
+    appear in the title — this is what fixes 'it played the wrong song/version'."""
+    title = entry.get("title") or ""
     q = original_query.lower()
 
-    if any(bad in title for bad in BAD_TITLE_KEYWORDS) and not any(bad in q for bad in BAD_TITLE_KEYWORDS):
-        score -= 5
+    query_words = _tokenize(original_query)
+    title_words = _tokenize(title)
+    overlap = len(query_words & title_words)
+    coverage = overlap / len(query_words) if query_words else 0
+    score = coverage * 10  # 0 to 10 — the dominant factor
+
+    title_lower = title.lower()
+    if any(bad in title_lower for bad in UNWANTED_VERSION_WORDS) and not any(
+        bad in q for bad in UNWANTED_VERSION_WORDS
+    ):
+        score -= 6
 
     duration = entry.get("duration") or 0
     if duration > LONG_TRACK_SECONDS and not any(w in q for w in LONG_TRACK_ALLOW_WORDS):
         score -= 4
-    elif 30 <= duration <= 600:  # a normal single-track length is a good sign
+    elif 30 <= duration <= 600:
         score += 1
 
-    # A channel/uploader whose name is closer to the query is often the official source.
     uploader = (entry.get("uploader") or entry.get("channel") or "").lower()
-    if uploader and any(word in uploader for word in q.split() if len(word) > 2):
-        score += 1
+    if uploader and any(word in uploader for word in query_words):
+        score += 1  # the official channel/artist page is often the right source
 
     return score
 
@@ -141,6 +175,46 @@ def pick_best_entry(entries, original_query: str):
         reverse=True,
     )
     return scored[0][1]
+
+
+AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm", ".opus")
+
+
+def normalize_key(s: str) -> str:
+    return s.strip().lower()
+
+
+def find_library_match(query: str):
+    """Returns the matching library key, or None. Exact match first, then fuzzy."""
+    key = normalize_key(query)
+    if key in music_library:
+        return key
+    matches = difflib.get_close_matches(key, music_library.keys(), n=1, cutoff=0.4)
+    if matches:
+        return matches[0]
+    for k in music_library:
+        if key in k:
+            return k
+    return None
+
+
+async def load_library():
+    """Scans the configured library channel's message history and indexes every
+    audio attachment by title (the message text, or the filename if there's none)."""
+    if not LIBRARY_CHANNEL_ID:
+        return
+    channel = bot.get_channel(LIBRARY_CHANNEL_ID)
+    if not channel:
+        print(f"Library channel {LIBRARY_CHANNEL_ID} not found or not accessible.")
+        return
+    count = 0
+    async for msg in channel.history(limit=None):
+        for att in msg.attachments:
+            if att.filename.lower().endswith(AUDIO_EXTENSIONS):
+                title = msg.content.strip() or att.filename.rsplit(".", 1)[0]
+                music_library[normalize_key(title)] = {"title": title, "url": att.url, "duration": None}
+                count += 1
+    print(f"Music library loaded: {count} track(s).")
 
 
 def format_duration(seconds):
@@ -173,7 +247,29 @@ def mark_resumed(guild_id):
         del paused_at[guild_id]
 
 
+def spotify_to_query(url: str) -> str:
+    """Spotify doesn't allow pulling audio (DRM), but its public oEmbed endpoint
+    (no API key required) gives us the track title + artist, which we then search
+    for on YouTube/SoundCloud like a normal text search."""
+    api = "https://open.spotify.com/oembed?url=" + urllib.parse.quote(url, safe="")
+    req = urllib.request.Request(api, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode())
+    title = (data.get("title") or "").strip()
+    author = (data.get("author_name") or "").strip()
+    combined = f"{title} {author}".strip()
+    if not combined:
+        raise ValueError("ما قدرت أجيب بيانات الأغنية من سبوتيفاي.")
+    return combined
+
+
 def fetch_stream(query, source="youtube"):
+    if source == "library":
+        entry = music_library.get(query)
+        if not entry:
+            raise ValueError("الأغنية دي مش موجودة في المكتبة.")
+        return entry["url"], entry["title"], entry.get("duration"), entry.get("thumbnail")
+
     with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
         info = ydl.extract_info(resolve(query, source), download=False)
         if "entries" in info:
@@ -597,7 +693,12 @@ async def play_next(guild, channel):
     except discord.ClientException:
         return
     now_playing[gid] = title
-    now_source[gid] = "SoundCloud" if src == "soundcloud" else "YouTube"
+    if src == "soundcloud":
+        now_source[gid] = "SoundCloud"
+    elif src == "library":
+        now_source[gid] = "📚 مكتبتنا"
+    else:
+        now_source[gid] = "YouTube"
     now_duration[gid] = duration
     now_url[gid] = url
     now_thumbnail[gid] = thumb
@@ -620,7 +721,21 @@ def guess_source(query: str) -> str:
     return "youtube"
 
 
+def is_spotify_track_link(query: str) -> bool:
+    q = query.strip().lower()
+    return q.startswith("http") and "open.spotify.com" in q and "/track" in q
+
+
 async def queue_and_play(ctx, query, source):
+    if is_spotify_track_link(query):
+        try:
+            resolved = await bot.loop.run_in_executor(None, spotify_to_query, query)
+        except Exception:
+            return await ctx.send("❌ ما قدرت أجيب بيانات الأغنية من سبوتيفاي.")
+        await ctx.send(f"🎧 من سبوتيفاي: **{resolved}** — بدوّر عليها في يوتيوب/ساوند كلاود")
+        query = resolved
+        source = guess_source(query)
+
     if not ctx.author.voice:
         return await ctx.send("ادخل روم صوتي أول.")
     if not ctx.voice_client:
@@ -648,6 +763,52 @@ async def music(ctx, *, query):
 async def sc(ctx, *, query):
     """يجبر البحث على ساوند كلاود فقط."""
     await queue_and_play(ctx, query, "soundcloud")
+
+
+@bot.command(name="addsong")
+async def addsong_cmd(ctx, *, title=None):
+    """يضيف ملف صوت مرفق مع الأمر لمكتبة الأغاني الخاصة. مثال: !addsong اسم الأغنية (مع إرفاق ملف mp3)."""
+    if not LIBRARY_CHANNEL_ID:
+        return await ctx.send("مكتبة الأغاني مش متفعّلة (محتاج متغير LIBRARY_CHANNEL_ID في Railway).")
+    if not ctx.message.attachments:
+        return await ctx.send("لازم ترفق ملف صوت (mp3, wav, m4a, ...) مع الأمر.")
+    att = ctx.message.attachments[0]
+    if not att.filename.lower().endswith(AUDIO_EXTENSIONS):
+        return await ctx.send("نوع الملف ده مش مدعوم.")
+    library_channel = bot.get_channel(LIBRARY_CHANNEL_ID)
+    if not library_channel:
+        return await ctx.send("مش لاقي قناة المكتبة، تأكد إن الـ ID صحيح والبوت عنده وصول لها.")
+
+    final_title = (title or att.filename.rsplit(".", 1)[0]).strip()
+    try:
+        file = await att.to_file()
+        sent = await library_channel.send(content=final_title, file=file)
+    except Exception as e:
+        return await ctx.send(f"❌ فشل الحفظ: {str(e)[:200]}")
+
+    stored_url = sent.attachments[0].url
+    music_library[normalize_key(final_title)] = {"title": final_title, "url": stored_url, "duration": None}
+    await ctx.send(f"✅ اتضافت للمكتبة: **{final_title}**")
+
+
+@bot.command(name="library")
+async def library_cmd(ctx):
+    """يعرض كل الأغاني الموجودة في المكتبة الخاصة."""
+    if not music_library:
+        return await ctx.send("المكتبة فاضية. ضيف أغاني بـ !addsong.")
+    titles = [e["title"] for e in music_library.values()]
+    lines = [f"{i}. {t}" for i, t in enumerate(titles[:30], 1)]
+    extra = f"\n... و{len(titles) - 30} أخرى" if len(titles) > 30 else ""
+    await ctx.send("📚 **مكتبة الأغاني:**\n" + "\n".join(lines) + extra)
+
+
+@bot.command(name="lib")
+async def lib_cmd(ctx, *, query):
+    """يشغّل أغنية من المكتبة الخاصة بدل يوتيوب/ساوند كلاود."""
+    match = find_library_match(query)
+    if not match:
+        return await ctx.send("ملقتش الأغنية دي في المكتبة. جرّب !library تشوف الأسماء المتاحة.")
+    await queue_and_play(ctx, match, "library")
 
 
 @bot.command(name="loop")
@@ -1030,6 +1191,10 @@ async def on_ready():
         print(f"Synced {len(synced)} slash command(s).")
     except Exception as e:
         print("Slash command sync failed:", e)
+    try:
+        await load_library()
+    except Exception as e:
+        print("Music library load failed:", e)
 
 
 load_opus()
