@@ -263,6 +263,54 @@ def spotify_to_query(url: str) -> str:
     return combined
 
 
+def audiomack_to_query(url: str) -> str:
+    """Audiomack's extractor in yt-dlp is broken (old API dead). We scrape the
+    page title instead and search YouTube/SoundCloud — same approach as Spotify."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+        },
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        html = resp.read().decode("utf-8", errors="ignore")
+
+    title = None
+    # Prefer Open Graph title
+    m = re.search(r'property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html, re.I)
+    if not m:
+        m = re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:title["\']', html, re.I)
+    if m:
+        title = m.group(1).strip()
+    if not title:
+        m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
+        if m:
+            title = m.group(1).strip()
+
+    if not title:
+        raise ValueError("ما قدرت أجيب اسم الأغنية من أوديوماك.")
+
+    # Clean typical Audiomack suffixes
+    for junk in [
+        ": Listen on Audiomack",
+        " | Audiomack",
+        " - Audiomack",
+        " on Audiomack",
+        "Audiomack",
+    ]:
+        if title.endswith(junk):
+            title = title[: -len(junk)].strip()
+        title = title.replace(junk, "").strip()
+
+    # "Song by Artist" → keep as is (good for search)
+    if not title:
+        raise ValueError("ما قدرت أجيب اسم الأغنية من أوديوماك.")
+    return title
+
+
 def fetch_stream(query, source="youtube"):
     if source == "library":
         entry = music_library.get(query)
@@ -764,7 +812,13 @@ def is_spotify_track_link(query: str) -> bool:
     return q.startswith("http") and "open.spotify.com" in q and "/track" in q
 
 
+def is_audiomack_link(query: str) -> bool:
+    q = query.strip().lower()
+    return q.startswith("http") and "audiomack.com" in q
+
+
 async def queue_and_play(ctx, query, source):
+    # Spotify → resolve title/artist then search
     if is_spotify_track_link(query):
         try:
             resolved = await bot.loop.run_in_executor(None, spotify_to_query, query)
@@ -772,7 +826,17 @@ async def queue_and_play(ctx, query, source):
             return await ctx.send("❌ ما قدرت أجيب بيانات الأغنية من سبوتيفاي.")
         await ctx.send(f"🎧 من سبوتيفاي: **{resolved}** — بدوّر عليها في يوتيوب/ساوند كلاود")
         query = resolved
-        source = guess_source(query)
+        source = "youtube"  # will trigger multi-search
+
+    # Audiomack → scrape title then search (yt-dlp extractor is broken)
+    elif is_audiomack_link(query):
+        try:
+            resolved = await bot.loop.run_in_executor(None, audiomack_to_query, query)
+        except Exception as e:
+            return await ctx.send(f"❌ ما قدرت أجيب بيانات الأغنية من أوديوماك: {str(e)[:120]}")
+        await ctx.send(f"🎧 من أوديوماك: **{resolved}** — بدوّر عليها في يوتيوب/ساوند كلاود")
+        query = resolved
+        source = "youtube"  # will trigger multi-search
 
     if not ctx.author.voice:
         return await ctx.send("ادخل روم صوتي أول.")
