@@ -277,9 +277,48 @@ def fetch_stream(query, source="youtube"):
         return info["url"], info["title"], info.get("duration"), info.get("thumbnail")
 
 
+def fetch_stream_multi(query: str):
+    """Searches YouTube AND SoundCloud for the same text query, pools every result,
+    and scores them all together so the single best match wins regardless of which
+    platform it came from. Returns (url, title, duration, thumbnail, used_source)."""
+    pooled = []  # list of (entry, source_name)
+
+    for source_name, prefix in (("youtube", "ytsearch"), ("soundcloud", "scsearch")):
+        try:
+            with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+                info = ydl.extract_info(f"{prefix}{SEARCH_RESULT_COUNT}:{query}", download=False)
+            for entry in info.get("entries", []) or []:
+                if entry:
+                    pooled.append((entry, source_name))
+        except Exception:
+            continue  # that platform failed/blocked — the other one may still have results
+
+    if not pooled:
+        raise ValueError("ما لقيتش نتائج في يوتيوب ولا ساوند كلاود.")
+
+    best_entry, best_source = max(pooled, key=lambda pair: score_search_result(pair[0], query))
+    return best_entry["url"], best_entry["title"], best_entry.get("duration"), best_entry.get("thumbnail"), best_source
+
+
 def fetch_with_fallback(query, source):
     """Returns (url, title, duration, thumbnail, used_source).
-    Retries once on transient errors, then falls back YouTube -> SoundCloud."""
+    - Links: fetched from their own platform, with a retry for transient errors.
+    - Forced source ("soundcloud" via !sc, or "library"): searched/looked up there only.
+    - Plain text with the default source ("youtube"): compared across YouTube AND
+      SoundCloud together via fetch_stream_multi, picking whichever result is the
+      better match — not just "try YouTube, then give up to SoundCloud"."""
+    is_link = query.strip().lower().startswith("http")
+
+    if not is_link and source == "youtube":
+        try:
+            return fetch_stream_multi(query)
+        except Exception as first_error:
+            time.sleep(2)
+            try:
+                return fetch_stream_multi(query)
+            except Exception:
+                raise first_error
+
     try:
         url, title, duration, thumb = fetch_stream(query, source)
         return url, title, duration, thumb, source
@@ -295,7 +334,6 @@ def fetch_with_fallback(query, source):
 
         if source != "youtube":
             raise first_error
-        is_link = query.strip().lower().startswith("http")
         if is_link:
             time.sleep(3)
             try:
