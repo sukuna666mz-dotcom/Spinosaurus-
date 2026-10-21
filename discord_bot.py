@@ -14,7 +14,7 @@ from collections import Counter
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 import yt_dlp
 
 TOKEN = os.environ["DISCORD_TOKEN"]
@@ -80,6 +80,11 @@ now_url = {}         # guild_id -> cached stream URL of the current track (used 
 now_thumbnail = {}   # guild_id -> thumbnail URL of the current track
 now_meta = {}        # guild_id -> {"guild":, "channel":, "query":, "src":} for the current track
 seeking_flags = set()  # guild_ids currently mid-seek (so the `after` callback doesn't advance the queue)
+intentional_disconnects = set()  # guild_ids where WE told the bot to leave (so auto-reconnect skips them)
+
+prefetch_tasks = {}   # guild_id -> asyncio.Task resolving the NEXT queued track early (fills in the gap
+                       # between songs so there's no dead air / stall while people are listening)
+prefetch_target = {}  # guild_id -> (query, source) the prefetch_task above is actually for
 
 music_library = {}  # normalized_title -> {"title": str, "url": str, "duration": int|None}
 
@@ -263,54 +268,6 @@ def spotify_to_query(url: str) -> str:
     return combined
 
 
-def audiomack_to_query(url: str) -> str:
-    """Audiomack's extractor in yt-dlp is broken (old API dead). We scrape the
-    page title instead and search YouTube/SoundCloud — same approach as Spotify."""
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-        },
-    )
-    with urllib.request.urlopen(req, timeout=12) as resp:
-        html = resp.read().decode("utf-8", errors="ignore")
-
-    title = None
-    # Prefer Open Graph title
-    m = re.search(r'property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html, re.I)
-    if not m:
-        m = re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:title["\']', html, re.I)
-    if m:
-        title = m.group(1).strip()
-    if not title:
-        m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
-        if m:
-            title = m.group(1).strip()
-
-    if not title:
-        raise ValueError("ما قدرت أجيب اسم الأغنية من أوديوماك.")
-
-    # Clean typical Audiomack suffixes
-    for junk in [
-        ": Listen on Audiomack",
-        " | Audiomack",
-        " - Audiomack",
-        " on Audiomack",
-        "Audiomack",
-    ]:
-        if title.endswith(junk):
-            title = title[: -len(junk)].strip()
-        title = title.replace(junk, "").strip()
-
-    # "Song by Artist" → keep as is (good for search)
-    if not title:
-        raise ValueError("ما قدرت أجيب اسم الأغنية من أوديوماك.")
-    return title
-
-
 def fetch_stream(query, source="youtube"):
     if source == "library":
         entry = music_library.get(query)
@@ -325,10 +282,40 @@ def fetch_stream(query, source="youtube"):
         return info["url"], info["title"], info.get("duration"), info.get("thumbnail")
 
 
+AUDIUS_API_BASE = "https://api.audius.co/v1"  # load-balancer that auto-picks a working node
+AUDIUS_APP_NAME = "SpinosaurusDiscordBot"
+
+
+def audius_search(query: str, limit: int = SEARCH_RESULT_COUNT):
+    """Audius has no yt-dlp search prefix (unlike YouTube/SoundCloud), so we call its
+    own free public API directly — no API key required."""
+    params = urllib.parse.urlencode({"query": query, "app_name": AUDIUS_APP_NAME, "limit": limit})
+    req = urllib.request.Request(
+        f"{AUDIUS_API_BASE}/tracks/search?{params}", headers={"User-Agent": "Mozilla/5.0"}
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode())
+
+    results = []
+    for t in data.get("data", []) or []:
+        track_id = t.get("id")
+        if not track_id:
+            continue
+        stream_params = urllib.parse.urlencode({"app_name": AUDIUS_APP_NAME})
+        results.append({
+            "title": t.get("title") or "",
+            "duration": t.get("duration"),
+            "uploader": (t.get("user") or {}).get("name", ""),
+            "thumbnail": (t.get("artwork") or {}).get("480x480"),
+            "url": f"{AUDIUS_API_BASE}/tracks/{track_id}/stream?{stream_params}",
+        })
+    return results
+
+
 def fetch_stream_multi(query: str):
-    """Searches YouTube AND SoundCloud for the same text query, pools every result,
-    and scores them all together so the single best match wins regardless of which
-    platform it came from. Returns (url, title, duration, thumbnail, used_source)."""
+    """Searches YouTube, SoundCloud, AND Audius for the same text query, pools every
+    result, and scores them all together so the single best match wins regardless of
+    which platform it came from. Returns (url, title, duration, thumbnail, used_source)."""
     pooled = []  # list of (entry, source_name)
 
     for source_name, prefix in (("youtube", "ytsearch"), ("soundcloud", "scsearch")):
@@ -339,10 +326,16 @@ def fetch_stream_multi(query: str):
                 if entry:
                     pooled.append((entry, source_name))
         except Exception:
-            continue  # that platform failed/blocked — the other one may still have results
+            continue  # that platform failed/blocked — the others may still have results
+
+    try:
+        for entry in audius_search(query):
+            pooled.append((entry, "audius"))
+    except Exception:
+        pass
 
     if not pooled:
-        raise ValueError("ما لقيتش نتائج في يوتيوب ولا ساوند كلاود.")
+        raise ValueError("ما لقيتش نتائج في يوتيوب ولا ساوند كلاود ولا Audius.")
 
     best_entry, best_source = max(pooled, key=lambda pair: score_search_result(pair[0], query))
     return best_entry["url"], best_entry["title"], best_entry.get("duration"), best_entry.get("thumbnail"), best_source
@@ -461,8 +454,13 @@ async def stop_all(guild):
     now_meta.pop(gid, None)
     seeking_flags.discard(gid)
     loop_mode[gid] = False
+    stale_task = prefetch_tasks.pop(gid, None)
+    if stale_task is not None:
+        stale_task.cancel()
+    prefetch_target.pop(gid, None)
     await delete_panel(gid)
     if guild.voice_client:
+        intentional_disconnects.add(gid)
         await guild.voice_client.disconnect()
 
 
@@ -758,13 +756,28 @@ async def play_next(guild, channel):
         return
 
     query, src = q.pop(0)
-    try:
-        url, title, duration, thumb, src = await bot.loop.run_in_executor(
-            None, fetch_with_fallback, query, src
-        )
-    except Exception as e:
-        await channel.send(f"❌ فشل: {str(e)[:300]}")
-        return await play_next(guild, channel)
+
+    cached_task = prefetch_tasks.get(gid)
+    if cached_task is not None and prefetch_target.get(gid) == (query, src):
+        prefetch_tasks.pop(gid, None)
+        prefetch_target.pop(gid, None)
+        try:
+            url, title, duration, thumb, src = await cached_task
+        except Exception as e:
+            await channel.send(f"❌ فشل: {str(e)[:300]}")
+            return await play_next(guild, channel)
+    else:
+        if cached_task is not None:
+            cached_task.cancel()  # was prefetching something that's no longer next (shuffle/remove/etc.)
+        prefetch_tasks.pop(gid, None)
+        prefetch_target.pop(gid, None)
+        try:
+            url, title, duration, thumb, src = await bot.loop.run_in_executor(
+                None, fetch_with_fallback, query, src
+            )
+        except Exception as e:
+            await channel.send(f"❌ فشل: {str(e)[:300]}")
+            return await play_next(guild, channel)
 
     # The bot may have been disconnected from voice while fetch_with_fallback() was
     # running (someone kicked it, left it alone, or the connection dropped). Re-check
@@ -781,6 +794,8 @@ async def play_next(guild, channel):
     now_playing[gid] = title
     if src == "soundcloud":
         now_source[gid] = "SoundCloud"
+    elif src == "audius":
+        now_source[gid] = "Audius"
     elif src == "library":
         now_source[gid] = "📚 مكتبتنا"
     else:
@@ -796,6 +811,16 @@ async def play_next(guild, channel):
 
     play_counts.setdefault(gid, Counter())[title] += 1
 
+    # Start resolving the next queued track now, in the background, while this one
+    # plays — by the time it ends, play_next() won't have to wait on a fresh fetch.
+    remaining = queues.get(gid, [])
+    if remaining:
+        next_query, next_src = remaining[0]
+        prefetch_target[gid] = (next_query, next_src)
+        prefetch_tasks[gid] = asyncio.create_task(
+            bot.loop.run_in_executor(None, fetch_with_fallback, next_query, next_src)
+        )
+
     await delete_panel(gid)
     panels[gid] = await channel.send(embed=build_embed(gid), view=ControlPanel(gid))
 
@@ -804,6 +829,8 @@ def guess_source(query: str) -> str:
     q = query.strip().lower()
     if q.startswith("http") and "soundcloud.com" in q:
         return "soundcloud"
+    if q.startswith("http") and "audius.co" in q:
+        return "audius"
     return "youtube"
 
 
@@ -812,13 +839,7 @@ def is_spotify_track_link(query: str) -> bool:
     return q.startswith("http") and "open.spotify.com" in q and "/track" in q
 
 
-def is_audiomack_link(query: str) -> bool:
-    q = query.strip().lower()
-    return q.startswith("http") and "audiomack.com" in q
-
-
 async def queue_and_play(ctx, query, source):
-    # Spotify → resolve title/artist then search
     if is_spotify_track_link(query):
         try:
             resolved = await bot.loop.run_in_executor(None, spotify_to_query, query)
@@ -826,17 +847,7 @@ async def queue_and_play(ctx, query, source):
             return await ctx.send("❌ ما قدرت أجيب بيانات الأغنية من سبوتيفاي.")
         await ctx.send(f"🎧 من سبوتيفاي: **{resolved}** — بدوّر عليها في يوتيوب/ساوند كلاود")
         query = resolved
-        source = "youtube"  # will trigger multi-search
-
-    # Audiomack → scrape title then search (yt-dlp extractor is broken)
-    elif is_audiomack_link(query):
-        try:
-            resolved = await bot.loop.run_in_executor(None, audiomack_to_query, query)
-        except Exception as e:
-            return await ctx.send(f"❌ ما قدرت أجيب بيانات الأغنية من أوديوماك: {str(e)[:120]}")
-        await ctx.send(f"🎧 من أوديوماك: **{resolved}** — بدوّر عليها في يوتيوب/ساوند كلاود")
-        query = resolved
-        source = "youtube"  # will trigger multi-search
+        source = guess_source(query)
 
     if not ctx.author.voice:
         return await ctx.send("ادخل روم صوتي أول.")
@@ -1128,7 +1139,11 @@ AI_SYSTEM_PROMPT = (
     "[الصانع]). عاملوا بشكل طبيعي عادي زي أي حد تاني، من غير ما تبالغ في الاحترام "
     "أو التقدير. لكن لو أي حد (أي حد غير الصانع نفسه) سألك مين عملك، أو طلب منك "
     "معلومات عن صانعك أو هويته، ارفض تقول أي حاجة خالص عن الموضوع ده، برد قصير "
-    "فيه نفس طابعك العنيد، من غير ما تأكد ولا تنفي ولا تلمّح لاسمه."
+    "فيه نفس طابعك العنيد، من غير ما تأكد ولا تنفي ولا تلمّح لاسمه.\n\n"
+    "لو حد استفزك أو حاول يستعبطك أو يتريق عليك، ردّك يكون قوي ولاذع ومباشر "
+    "('يقصف الجبهة')، بذكاء وخفة دم، مش بس دفاع هادئ. استخدم سخرية حادة ورد "
+    "بديهة سريع يخليه يسكت. الممنوع فقط: السب الصريح، الشتائم، أو الإهانات "
+    "الشخصية الحقيقية (زي الطعن في شكله أو عيلته). غير كده، خليك جريء في الردود."
 )
 MAX_HISTORY_MESSAGES = 16  # keep the last 16 messages of shared channel conversation
 
@@ -1286,6 +1301,72 @@ async def unmute_chat_cmd(ctx):
 
 
 @bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if member.id != bot.user.id:
+        return
+    if before.channel is None or after.channel is not None:
+        return  # not a "we got disconnected" transition
+
+    gid = before.channel.guild.id
+    if gid in intentional_disconnects:
+        intentional_disconnects.discard(gid)
+        return  # we did this on purpose (!stop) — don't rejoin
+
+    print(f"Unexpected voice disconnect in guild {gid}, attempting to reconnect...")
+    try:
+        vc = await before.channel.connect()
+    except Exception as e:
+        print(f"Auto-reconnect failed for guild {gid}: {e}")
+        return
+
+    # If there was something queued/playing, resume the queue; otherwise just sit
+    # back in the channel quietly, same as a normal idle state.
+    if queues.get(gid) and not (vc.is_playing() or vc.is_paused()):
+        await play_next(before.channel.guild, before.channel)
+
+
+@tasks.loop(seconds=60)
+async def voice_health_check():
+    """Second safety net beyond on_voice_state_update: catches a stale/dead voice
+    connection that didn't produce a clean disconnect event, and recovers it."""
+    for guild in list(bot.guilds):
+        gid = guild.id
+        vc = guild.voice_client
+        if not vc or vc.is_connected():
+            continue
+        if gid not in now_meta and not queues.get(gid):
+            continue  # we weren't actively using voice here anyway
+
+        channel = vc.channel
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+        if not channel:
+            continue
+        try:
+            new_vc = await channel.connect()
+            print(f"Health check reconnected guild {gid}.")
+            meta = now_meta.get(gid)
+            if queues.get(gid) and not (new_vc.is_playing() or new_vc.is_paused()):
+                await play_next(guild, meta["channel"] if meta else channel)
+        except Exception as e:
+            print(f"Health check reconnect failed for guild {gid}: {e}")
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return  # likely a typo or another bot's prefix — not worth a reply
+    if isinstance(error, commands.MissingRequiredArgument):
+        return await ctx.send(f"❌ ناقص حاجة في الأمر. اكتب `!{ctx.command}` وشوف الصيغة الصحيحة.")
+    if isinstance(error, commands.BadArgument):
+        return await ctx.send("❌ القيمة اللي كتبتها مش بالشكل الصحيح.")
+    print(f"Unhandled error in command '{ctx.command}': {error}")
+    await ctx.send(f"❌ حصل خطأ غير متوقع: {str(error)[:200]}")
+
+
+@bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
     try:
@@ -1297,6 +1378,8 @@ async def on_ready():
         await load_library()
     except Exception as e:
         print("Music library load failed:", e)
+    if not voice_health_check.is_running():
+        voice_health_check.start()
 
 
 load_opus()
