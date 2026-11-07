@@ -1,5 +1,7 @@
 import os
 import re
+import sys
+import shutil
 import json
 import time
 import glob
@@ -16,6 +18,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import yt_dlp
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # reads a .env file in the working directory, if present, into os.environ
+except ImportError:
+    pass  # fine on hosts (like Railway) that already inject env vars directly
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")  # optional, enables /play autocomplete
@@ -55,9 +63,8 @@ FFMPEG_OPTS = {
         "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
         "-reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx"
     ),
-    # -ar/-ac match Discord's required 48kHz stereo PCM exactly, avoiding any
-    # unnecessary extra resampling pass.
-    "options": "-vn -ar 48000 -ac 2",
+    # discord.py already appends -ar 48000 -ac 2 itself, so we don't repeat them.
+    "options": "-vn",
 }
 
 intents = discord.Intents.default()
@@ -312,33 +319,80 @@ def audius_search(query: str, limit: int = SEARCH_RESULT_COUNT):
     return results
 
 
-def fetch_stream_multi(query: str):
-    """Searches YouTube, SoundCloud, AND Audius for the same text query, pools every
-    result, and scores them all together so the single best match wins regardless of
-    which platform it came from. Returns (url, title, duration, thumbnail, used_source)."""
-    pooled = []  # list of (entry, source_name)
+MAX_RESOLVE_ATTEMPTS = 4      # how many ranked candidates we try to actually resolve per search
+SOURCE_COOLDOWN_SECONDS = 300  # after a platform blocks us (bot check / 429), skip it for a while
+source_cooldown = {}          # source_name -> time.time() until which we skip resolving from it
+
+
+def _is_systemic_block(error: Exception) -> bool:
+    """Errors that mean 'this whole platform is refusing us right now', as opposed to a
+    single bad track (e.g. one DRM-protected SoundCloud song)."""
+    msg = str(error).lower()
+    return any(k in msg for k in ("sign in", "not a bot", "429", "too many requests"))
+
+
+def search_candidates(query: str):
+    """Cheap search: ONE flat request per platform, nothing is resolved yet. A single
+    unplayable result (sign-in required, DRM...) can no longer wipe out the whole list."""
+    flat_opts = {**YDL_OPTS, "extract_flat": True, "ignoreerrors": True}
+    candidates = []  # list of (entry, source_name)
 
     for source_name, prefix in (("youtube", "ytsearch"), ("soundcloud", "scsearch")):
         try:
-            with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+            with yt_dlp.YoutubeDL(flat_opts) as ydl:
                 info = ydl.extract_info(f"{prefix}{SEARCH_RESULT_COUNT}:{query}", download=False)
-            for entry in info.get("entries", []) or []:
-                if entry:
-                    pooled.append((entry, source_name))
+            for entry in (info or {}).get("entries", []) or []:
+                if not entry or not entry.get("title"):
+                    continue
+                if not entry.get("url") and source_name == "youtube" and entry.get("id"):
+                    entry["url"] = f"https://www.youtube.com/watch?v={entry['id']}"
+                if entry.get("url"):
+                    candidates.append((entry, source_name))
         except Exception:
-            continue  # that platform failed/blocked — the others may still have results
+            continue  # that platform failed — the others may still have results
 
     try:
         for entry in audius_search(query):
-            pooled.append((entry, "audius"))
+            candidates.append((entry, "audius"))
     except Exception:
         pass
 
-    if not pooled:
+    return candidates
+
+
+def fetch_stream_multi(query: str):
+    """Searches YouTube, SoundCloud and Audius, ranks every candidate together, then
+    resolves the best ones in order until one actually works. Returns
+    (url, title, duration, thumbnail, used_source)."""
+    candidates = search_candidates(query)
+    if not candidates:
         raise ValueError("ما لقيتش نتائج في يوتيوب ولا ساوند كلاود ولا Audius.")
 
-    best_entry, best_source = max(pooled, key=lambda pair: score_search_result(pair[0], query))
-    return best_entry["url"], best_entry["title"], best_entry.get("duration"), best_entry.get("thumbnail"), best_source
+    # sorted() is stable, so ties keep the original order (YouTube, SoundCloud, Audius)
+    ranked = sorted(candidates, key=lambda pair: score_search_result(pair[0], query), reverse=True)
+
+    attempts = 0
+    last_error = None
+    for entry, source_name in ranked:
+        if attempts >= MAX_RESOLVE_ATTEMPTS:
+            break
+        if source_cooldown.get(source_name, 0) > time.time():
+            continue  # this platform is currently blocking us; don't waste an attempt on it
+        attempts += 1
+
+        if source_name == "audius":  # already a direct stream URL, nothing to resolve
+            return entry["url"], entry["title"], entry.get("duration"), entry.get("thumbnail"), "audius"
+
+        try:
+            url, title, duration, thumb = fetch_stream(entry["url"], source_name)
+            return url, title, duration, thumb, source_name
+        except Exception as e:
+            last_error = e
+            if _is_systemic_block(e):
+                source_cooldown[source_name] = time.time() + SOURCE_COOLDOWN_SECONDS
+            continue  # try the next-best candidate
+
+    raise last_error or ValueError("كل النتائج اللي لقيتها مش قابلة للتشغيل دلوقتي.")
 
 
 def fetch_with_fallback(query, source):
@@ -1298,6 +1352,39 @@ async def unmute_chat_cmd(ctx):
     """يرجّع البوت يرد على باقي البوتات في القناة دي بعد ما كان مسكوت."""
     muted_bot_chat_channels.discard(ctx.channel.id)
     await ctx.send("🗣️ تمام، رجعت أتكلم.")
+
+
+
+@bot.command(name="diag")
+async def diag_cmd(ctx):
+    """تشخيص سريع للصوت (للصانع فقط): Opus وffmpeg وحالة الاتصال الصوتي."""
+    if ctx.author.id != CREATOR_ID:
+        return await ctx.send("مش من حقك.")
+
+    def has(mod):
+        try:
+            __import__(mod)
+            return "✅"
+        except Exception:
+            return "❌"
+
+    vc = ctx.voice_client
+    if vc and vc.is_connected():
+        voice = f"✅ متصل (latency ~{vc.latency * 1000:.0f}ms)"
+    elif vc:
+        voice = "⚠️ فيه اتصال لكنه غير متصل فعلياً"
+    else:
+        voice = "— مش داخل روم صوتي دلوقتي"
+
+    await ctx.send(
+        "🔎 **تشخيص الصوت**\n"
+        f"Opus محمّل: {'✅' if discord.opus.is_loaded() else '❌'}\n"
+        f"ffmpeg: {'✅ ' + shutil.which('ffmpeg') if shutil.which('ffmpeg') else '❌ مش موجود'}\n"
+        f"PyNaCl: {has('nacl')} | davey: {has('davey')}\n"
+        f"yt-dlp: {yt_dlp.version.__version__}\n"
+        f"Python: {sys.version.split()[0]}\n"
+        f"الاتصال الصوتي: {voice}"
+    )
 
 
 @bot.event

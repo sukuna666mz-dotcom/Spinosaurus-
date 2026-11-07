@@ -1,4 +1,6 @@
-discord.py
-yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
+discord.py[voice]
 PyNaCl
 davey
+yt-dlp
+python-dotenv
+aiohttp
