@@ -9,6 +9,7 @@ import random
 import difflib
 import asyncio
 import ctypes.util
+from importlib.metadata import version as _pv, PackageNotFoundError
 import urllib.request
 import urllib.parse
 from collections import Counter
@@ -30,6 +31,13 @@ YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")  # optional, enables /play a
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")  # optional, enables @mention AI chat (free at console.groq.com)
 GROQ_MODEL = "openai/gpt-oss-120b"
 LIBRARY_CHANNEL_ID = int(os.environ["LIBRARY_CHANNEL_ID"]) if os.environ.get("LIBRARY_CHANNEL_ID") else None
+
+
+def pkg_version(name):
+    try:
+        return _pv(name)
+    except PackageNotFoundError:
+        return "❌"
 
 
 def load_opus():
@@ -1381,7 +1389,10 @@ async def diag_cmd(ctx):
         f"Opus محمّل: {'✅' if discord.opus.is_loaded() else '❌'}\n"
         f"ffmpeg: {'✅ ' + shutil.which('ffmpeg') if shutil.which('ffmpeg') else '❌ مش موجود'}\n"
         f"PyNaCl: {has('nacl')} | davey: {has('davey')}\n"
+        f"discord.py: {discord.__version__} (لازم 2.7 أو أحدث)\n"
+        f"davey: {pkg_version('davey')} | PyNaCl: {pkg_version('PyNaCl')}\n"
         f"yt-dlp: {yt_dlp.version.__version__}\n"
+        f"deno (لليوتيوب): {'✅' if shutil.which('deno') else '❌ مش موجود'}\n"
         f"Python: {sys.version.split()[0]}\n"
         f"الاتصال الصوتي: {voice}"
     )
