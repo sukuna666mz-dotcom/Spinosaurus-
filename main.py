@@ -79,6 +79,22 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+
+@bot.command(name="tone")
+async def tone_cmd(ctx):
+    """اختبار صوت: نغمة مولّدة داخلياً بدون يوتيوب أو سوندكلاود."""
+    if not ctx.author.voice:
+        return await ctx.send("ادخل روم صوتي الأول")
+    vc = ctx.voice_client or await ctx.author.voice.channel.connect()
+    if vc.is_playing():
+        vc.stop()
+    vc.play(discord.FFmpegPCMAudio(
+        "sine=frequency=440:duration=5",
+        before_options="-f lavfi",
+        options="-vn",
+    ))
+    await ctx.send("🔊 نغمة لمدة 5 ثواني")
+
 queues = {}          # guild_id -> list of (query, source) tuples
 volumes = {}         # guild_id -> float (0.1 - 1.5)
 now_playing = {}     # guild_id -> title
